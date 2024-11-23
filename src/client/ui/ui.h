@@ -38,6 +38,8 @@ with this program; if not, write to the Free Software Foundation, Inc.,
 #define MIN_MENU_ITEMS  64
 #define MAX_MENU_ITEMS  250000000
 
+#define UI_DEFAULT_FILE     APPLICATION ".menu"
+
 typedef enum {
     MTYPE_BAD,
     MTYPE_SLIDER,
@@ -55,7 +57,10 @@ typedef enum {
     MTYPE_KEYBIND,
     MTYPE_BITMAP,
     MTYPE_SAVEGAME,
-    MTYPE_LOADGAME
+    MTYPE_LOADGAME,
+    MTYPE_IMAGESPINCONTROL,
+    MTYPE_EPISODE,
+    MTYPE_UNIT,
 } menuType_t;
 
 #define QMF_LEFT_JUSTIFY    BIT(0)
@@ -147,7 +152,7 @@ typedef struct menuCommon_s {
     menuSound_t (*focus)(struct menuCommon_s *, bool gain);
 } menuCommon_t;
 
-typedef struct menuField_s {
+typedef struct {
     menuCommon_t generic;
     inputField_t field;
     cvar_t *cvar;
@@ -156,7 +161,7 @@ typedef struct menuField_s {
 
 #define SLIDER_RANGE 10
 
-typedef struct menuSlider_s {
+typedef struct {
     menuCommon_t generic;
     cvar_t *cvar;
     bool modified;
@@ -179,7 +184,7 @@ typedef struct menuSlider_s {
 #define MLF_SCROLLBAR   BIT(1)
 #define MLF_COLOR       BIT(2)
 
-typedef struct menuListColumn_s {
+typedef struct {
     const char *name;
     int width;
     int uiFlags;
@@ -213,7 +218,7 @@ typedef struct menuList_s {
     menuSound_t (*sort)(struct menuList_s *);
 } menuList_t;
 
-typedef struct menuSpinControl_s {
+typedef struct {
     menuCommon_t generic;
     cvar_t *cvar;
 
@@ -224,29 +229,42 @@ typedef struct menuSpinControl_s {
 
     int         mask;
     bool        negate;
+
+    // for image spin control
+    char *path;
+    char *filter;
 } menuSpinControl_t;
 
-typedef struct menuAction_s {
+typedef struct {
+    menuSpinControl_t   spin;
+} menuEpisodeSelector_t;
+
+typedef struct {
+    menuSpinControl_t   spin;
+    int                 *itemindices;
+} menuUnitSelector_t;
+
+typedef struct {
     menuCommon_t generic;
     char *cmd;
 } menuAction_t;
 
-typedef struct menuSeparator_s {
+typedef struct {
     menuCommon_t generic;
 } menuSeparator_t;
 
-typedef struct menuStatic_s {
+typedef struct {
     menuCommon_t    generic;
     int             maxChars;
 } menuStatic_t;
 
-typedef struct menuBitmap_s {
+typedef struct {
     menuCommon_t generic;
     qhandle_t pics[2];
     char *cmd;
 } menuBitmap_t;
 
-typedef struct menuKeybind_s {
+typedef struct {
     menuCommon_t    generic;
     char            binding[32];
     char            altbinding[32];
@@ -256,7 +274,7 @@ typedef struct menuKeybind_s {
 
 #define MAX_PLAYERMODELS 1024
 
-typedef struct playerModelInfo_s {
+typedef struct {
     int nskins;
     char **skindisplaynames;
     char *directory;
@@ -264,6 +282,9 @@ typedef struct playerModelInfo_s {
 
 void PlayerModel_Load(void);
 void PlayerModel_Free(void);
+
+void ImageSpinControl_Pop(menuSpinControl_t *s);
+void ImageSpinControl_Init(menuSpinControl_t *s);
 
 #define MAX_MENU_DEPTH    8
 
@@ -273,7 +294,7 @@ void PlayerModel_Free(void);
 
 #define NUM_CURSOR_FRAMES 15
 
-typedef struct uiStatic_s {
+typedef struct {
     bool initialized;
     unsigned realtime;
     int width, height; // scaled
@@ -317,13 +338,12 @@ void        UI_ForceMenuOff(void);
 void        UI_PopMenu(void);
 void        UI_StartSound(menuSound_t sound);
 bool        UI_DoHitTest(void);
-bool        UI_CursorInRect(vrect_t *rect);
+bool        UI_CursorInRect(const vrect_t *rect);
 void        *UI_FormatColumns(int extrasize, ...) q_sentinel;
 char        *UI_GetColumn(char *s, int n);
-void        UI_DrawString(int x, int y, int flags, const char *string);
-void        UI_DrawChar(int x, int y, int flags, int ch);
+void        UI_DrawString(int x, int y, int flags, color_t color, const char *string);
+void        UI_DrawChar(int x, int y, int flags, color_t color, int ch);
 void        UI_DrawRect8(const vrect_t *rect, int border, int c);
-//void        UI_DrawRect32(const vrect_t *rect, int border, uint32_t color);
 void        UI_StringDimensions(vrect_t *rc, int flags, const char *string);
 
 void        UI_LoadScript(void);
@@ -355,3 +375,8 @@ void        Menu_Free(menuFrameWork_t *menu);
 void M_Menu_PlayerConfig(void);
 void M_Menu_Demos(void);
 void M_Menu_Servers(void);
+
+void UI_MapDB_FetchEpisodes(char ***items, int *num_items);
+void UI_MapDB_FetchUnits(char ***items, int **item_indices, int *num_items);
+void UI_MapDB_Init(void);
+void UI_MapDB_Shutdown(void);

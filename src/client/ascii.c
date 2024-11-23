@@ -29,7 +29,7 @@ STAT PROGRAMS TO TEXT
 #define TH_WIDTH    80
 #define TH_HEIGHT   40
 
-static void TH_DrawString(char *dst, int x, int y, char *src, size_t len)
+static void TH_DrawString(char *dst, int x, int y, const char *src, size_t len)
 {
     int c;
 
@@ -58,7 +58,7 @@ static void TH_DrawString(char *dst, int x, int y, char *src, size_t len)
     }
 }
 
-static void TH_DrawCenterString(char *dst, int x, int y, char *src, size_t len)
+static void TH_DrawCenterString(char *dst, int x, int y, const char *src, size_t len)
 {
     x -= len / 2;
     if (x < 0) {
@@ -151,7 +151,7 @@ static void TH_DrawLayoutString(char *dst, const char *s)
 
         if (!strcmp(token, "pic")) {
             // draw a pic from a stat number
-            COM_Parse(&s);
+            COM_SkipToken(&s);
             continue;
         }
 
@@ -223,7 +223,7 @@ static void TH_DrawLayoutString(char *dst, const char *s)
 
         if (!strcmp(token, "picn")) {
             // draw a pic from a name
-            COM_Parse(&s);
+            COM_SkipToken(&s);
             continue;
         }
 
@@ -335,7 +335,7 @@ static void SCR_ScoreShot_f(void)
     }
 
     TH_DrawLayoutString(buffer, cl.configstrings[CS_STATUSBAR]);
-    TH_DrawLayoutString(buffer, cl.layout);
+    TH_DrawLayoutString(buffer, cl.cgame_data.layout);
 
     FS_Write(buffer, sizeof(buffer), f);
 
@@ -362,7 +362,7 @@ static void SCR_ScoreDump_f(void)
     buffer[i * (TH_WIDTH + 1) + TH_WIDTH] = 0;
 
     TH_DrawLayoutString(buffer, cl.configstrings[CS_STATUSBAR]);
-    TH_DrawLayoutString(buffer, cl.layout);
+    TH_DrawLayoutString(buffer, cl.cgame_data.layout);
 
     Com_Printf("%s\n", buffer);
 }

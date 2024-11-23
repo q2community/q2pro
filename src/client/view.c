@@ -69,21 +69,31 @@ static void V_ClearScene(void)
     r_numparticles = 0;
 }
 
-
 /*
 =====================
 V_AddEntity
 
 =====================
 */
-void V_AddEntity(entity_t *ent)
+void V_AddEntity(const entity_t *ent)
 {
     if (r_numentities >= MAX_ENTITIES)
+    {
+        if (ent->flags & RF_LOW_PRIORITY)
+            return;
+
+        for (size_t i = 0; i < r_numentities; i++) {
+            if (r_entities[i].flags & RF_LOW_PRIORITY) {
+                r_entities[i] = *ent;
+                return;
+            }
+        }
+
         return;
+    }
 
     r_entities[r_numentities++] = *ent;
 }
-
 
 /*
 =====================
@@ -91,11 +101,43 @@ V_AddParticle
 
 =====================
 */
-void V_AddParticle(particle_t *p)
+void V_AddParticle(const particle_t *p)
 {
     if (r_numparticles >= MAX_PARTICLES)
         return;
     r_particles[r_numparticles++] = *p;
+}
+
+/*
+=====================
+V_AddLightEx
+
+=====================
+*/
+void V_AddLightEx(cl_shadow_light_t *light)
+{
+    dlight_t    *dl;
+
+    if (r_numdlights >= MAX_DLIGHTS)
+        return;
+
+    dl = &r_dlights[r_numdlights++];
+    VectorCopy(light->origin, dl->origin);
+    dl->radius = light->radius;
+    dl->intensity = light->intensity * (light->lightstyle == -1 ? 1.0f : r_lightstyles[light->lightstyle].white);
+    dl->color[0] = light->color.r / 255.f;
+    dl->color[1] = light->color.g / 255.f;
+    dl->color[2] = light->color.b / 255.f;
+
+    if (light->coneangle) {
+        VectorCopy(light->conedirection, dl->cone);
+        dl->cone[3] = light->coneangle;
+    } else {
+        dl->cone[3] = 0.0f;
+    }
+
+    dl->fade[0] = light->fade_start;
+    dl->fade[1] = light->fade_end;
 }
 
 /*
@@ -112,10 +154,13 @@ void V_AddLight(const vec3_t org, float intensity, float r, float g, float b)
         return;
     dl = &r_dlights[r_numdlights++];
     VectorCopy(org, dl->origin);
-    dl->intensity = intensity;
+    dl->radius = intensity;
+    dl->intensity = 1.0f;
     dl->color[0] = r;
     dl->color[1] = g;
     dl->color[2] = b;
+    dl->cone[3] = 0.0f;
+    dl->fade[0] = dl->fade[1] = 0.0f;
 }
 
 /*
@@ -217,7 +262,8 @@ static void V_TestLights(void)
             VectorSet(dl->color, -1, -1, -1);
         else
             VectorSet(dl->color, 1, 1, 1);
-        dl->intensity = 256;
+        dl->radius = 256;
+        dl->intensity = 1.0f;
         return;
     }
 
@@ -236,7 +282,8 @@ static void V_TestLights(void)
         dl->color[0] = ((i % 6) + 1) & 1;
         dl->color[1] = (((i % 6) + 1) & 2) >> 1;
         dl->color[2] = (((i % 6) + 1) & 4) >> 2;
-        dl->intensity = 200;
+        dl->radius = 200;
+        dl->intensity = 1.0f;
     }
 }
 
@@ -250,9 +297,10 @@ void CL_UpdateBlendSetting(void)
         return;
     }
 
-    MSG_WriteByte(clc_setting);
-    MSG_WriteShort(CLS_NOBLEND);
-    MSG_WriteShort(!cl_add_blend->integer);
+    q2proto_clc_message_t message = {.type = Q2P_CLC_SETTING, .setting = {0}};
+    message.setting.index = CLS_NOBLEND;
+    message.setting.value = !cl_add_blend->integer;
+    q2proto_client_write(&cls.q2proto_ctx, Q2PROTO_IOARG_CLIENT_WRITE, &message);
     MSG_FlushTo(&cls.netchan.message);
 }
 
@@ -291,12 +339,21 @@ static int entitycmpfnc(const void *_a, const void *_b)
 {
     const entity_t *a = (const entity_t *)_a;
     const entity_t *b = (const entity_t *)_b;
-
+    
     // all other models are sorted by model then skin
-    if (a->model == b->model)
-        return a->skin - b->skin;
-    else
-        return a->model - b->model;
+    if (a->model > b->model)
+        return 1;
+    if (a->model < b->model)
+        return -1;
+
+    if (a->skin > b->skin)
+        return 1;
+    if (a->skin < b->skin)
+        return -1;
+
+    bool a_shell = a->flags & RF_SHELL_MASK;
+    bool b_shell = b->flags & RF_SHELL_MASK;
+    return a_shell - b_shell;
 }
 
 static void V_SetLightLevel(void)
@@ -336,14 +393,78 @@ float V_CalcFov(float fov_x, float width, float height)
     if (fov_x < 0.75f || fov_x > 179)
         Com_Error(ERR_DROP, "%s: bad fov: %f", __func__, fov_x);
 
-    x = width / tan(fov_x * (M_PI / 360));
+    x = width / tanf(fov_x * (M_PIf / 360));
 
-    a = atan(height / x);
-    a = a * (360 / M_PI);
+    a = atanf(height / x);
+    a = a * (360 / M_PIf);
 
     return a;
 }
 
+/*
+====================
+CL_ServerTime
+====================
+*/
+int CL_ServerTime(void)
+{
+    return cl.servertime;
+}
+
+/*
+==================
+V_RenderView
+
+==================
+*/
+void V_FogParamsChanged(unsigned bits, unsigned color_bits, unsigned hf_start_color_bits, unsigned hf_end_color_bits, const cl_fog_params_t *params, int time)
+{
+    if (time != 0) {
+        // shift the current fog values back to start
+        cl.fog.start = cl.fog.end;
+        cl.fog.lerp_time = time;
+        cl.fog.lerp_time_start = cl.time;
+    } else {
+        // no lerp, just disable lerp entirely
+        cl.fog.lerp_time = 0;
+    }
+
+    cl_fog_params_t *cur = &cl.fog.end;
+
+    // fill in updated values in end
+    if (bits & Q2P_FOG_DENSITY_SKYFACTOR) {
+        cur->linear.density = params->linear.density; // Kex divides the density by 64, prob because of exp2
+        cur->linear.sky_factor = params->linear.sky_factor;
+    }
+
+    if (color_bits & BIT(0))
+        cur->linear.color[0] = params->linear.color[0];
+    if (color_bits & BIT(1))
+        cur->linear.color[1] = params->linear.color[1];
+    if (color_bits & BIT(2))
+        cur->linear.color[2] = params->linear.color[2];
+    
+    if (bits & Q2P_HEIGHTFOG_FALLOFF)
+        cur->height.falloff = params->height.falloff;
+    if (bits & Q2P_HEIGHTFOG_DENSITY)
+        cur->height.density = params->height.density;
+    if (hf_start_color_bits & BIT(0))
+        cur->height.start.color[0] = params->height.start.color[0];
+    if (hf_start_color_bits & BIT(1))
+        cur->height.start.color[1] = params->height.start.color[1];
+    if (hf_start_color_bits & BIT(2))
+        cur->height.start.color[2] = params->height.start.color[2];
+    if (bits & Q2P_HEIGHTFOG_START_DIST)
+        cur->height.start.dist = params->height.start.dist;
+    if (hf_end_color_bits & BIT(0))
+        cur->height.end.color[0] = params->height.end.color[0];
+    if (hf_end_color_bits & BIT(1))
+        cur->height.end.color[1] = params->height.end.color[1];
+    if (hf_end_color_bits & BIT(2))
+        cur->height.end.color[2] = params->height.end.color[2];
+    if (bits & Q2P_HEIGHTFOG_END_DIST)
+        cur->height.end.dist = params->height.end.dist;
+}
 
 /*
 ==================
@@ -370,12 +491,10 @@ void V_RenderView(void)
             V_TestEntities();
         if (cl_testlights->integer)
             V_TestLights();
-        if (cl_testblend->integer) {
-            cl.refdef.blend[0] = 1;
-            cl.refdef.blend[1] = 0.5f;
-            cl.refdef.blend[2] = 0.25f;
-            cl.refdef.blend[3] = 0.5f;
-        }
+        if (cl_testblend->integer & 1)
+            Vector4Set(cl.refdef.screen_blend, 1, 0.5f, 0.25f, 0.5f);
+        if (cl_testblend->integer & 2)
+            Vector4Set(cl.refdef.damage_blend, 0.25f, 0.5f, 0.7f, 0.5f);
 #endif
 
         // never let it sit exactly on a node line, because a water plane can
@@ -385,10 +504,10 @@ void V_RenderView(void)
         cl.refdef.vieworg[1] += 1.0f / 16;
         cl.refdef.vieworg[2] += 1.0f / 16;
 
-        cl.refdef.x = scr_vrect.x;
-        cl.refdef.y = scr_vrect.y;
-        cl.refdef.width = scr_vrect.width;
-        cl.refdef.height = scr_vrect.height;
+        cl.refdef.x = scr.vrect.x;
+        cl.refdef.y = scr.vrect.y;
+        cl.refdef.width = scr.vrect.width;
+        cl.refdef.height = scr.vrect.height;
 
         // adjust for non-4/3 screens
         if (cl_adjustfov->integer) {
@@ -413,8 +532,10 @@ void V_RenderView(void)
             r_numparticles = 0;
         if (!cl_add_lights->integer)
             r_numdlights = 0;
-        if (!cl_add_blend->integer)
-            Vector4Clear(cl.refdef.blend);
+        if (!cl_add_blend->integer) {
+            Vector4Clear(cl.refdef.screen_blend);
+            Vector4Clear(cl.refdef.damage_blend);
+        }
 
         cl.refdef.num_entities = r_numentities;
         cl.refdef.entities = r_entities;
@@ -423,10 +544,45 @@ void V_RenderView(void)
         cl.refdef.num_dlights = r_numdlights;
         cl.refdef.dlights = r_dlights;
         cl.refdef.lightstyles = r_lightstyles;
-        cl.refdef.rdflags = cl.frame.ps.rdflags;
+        cl.refdef.rdflags = cl.frame.ps.rdflags | cl.predicted_rdflags;
+        cl.refdef.extended = cl.csr.extended;
 
         // sort entities for better cache locality
         qsort(cl.refdef.entities, cl.refdef.num_entities, sizeof(cl.refdef.entities[0]), entitycmpfnc);
+
+        if (cl.fog.lerp_time == 0 || cl.time > cl.fog.lerp_time_start + cl.fog.lerp_time) {
+            cl.refdef.fog = cl.fog.end.linear;
+            cl.refdef.heightfog = cl.fog.end.height;
+        } else {
+            float fog_frontlerp = (cl.time - cl.fog.lerp_time_start) / (float) cl.fog.lerp_time;
+            float fog_backlerp = 1.0f - fog_frontlerp;
+            
+#define Q_FP(p) \
+                cl.refdef.fog.p = LERP2(cl.fog.start.linear.p, cl.fog.end.linear.p, fog_backlerp, fog_frontlerp)
+#define Q_HFP(p) \
+                cl.refdef.heightfog.p = LERP2(cl.fog.start.height.p, cl.fog.end.height.p, fog_backlerp, fog_frontlerp)
+
+            Q_FP(color[0]);
+            Q_FP(color[1]);
+            Q_FP(color[2]);
+            Q_FP(density);
+            Q_FP(sky_factor);
+
+            Q_HFP(start.color[0]);
+            Q_HFP(start.color[1]);
+            Q_HFP(start.color[2]);
+            Q_HFP(start.dist);
+
+            Q_HFP(end.color[0]);
+            Q_HFP(end.color[1]);
+            Q_HFP(end.color[2]);
+            Q_HFP(end.dist);
+            
+            Q_HFP(density);
+            Q_HFP(falloff);
+
+#undef Q_FP
+        }
     }
 
     R_RenderFrame(&cl.refdef);
@@ -449,11 +605,25 @@ static void V_Viewpos_f(void)
     Com_Printf("%s : %.f\n", vtos(cl.refdef.vieworg), cl.refdef.viewangles[YAW]);
 }
 
+static void V_Fog_f(void)
+{
+    cl_fog_params_t p;
+    p.linear.color[0] = atof(Cmd_Argv(1));
+    p.linear.color[1] = atof(Cmd_Argv(2));
+    p.linear.color[2] = atof(Cmd_Argv(3));
+    p.linear.density = atof(Cmd_Argv(4));
+    p.linear.sky_factor = atof(Cmd_Argv(5));
+    int time = atoi(Cmd_Argv(6));
+
+    V_FogParamsChanged(Q2P_FOG_DENSITY_SKYFACTOR, BIT(0) | BIT(1) | BIT(2), 0, 0, &p, time);
+}
+
 static const cmdreg_t v_cmds[] = {
     { "gun_next", V_Gun_Next_f },
     { "gun_prev", V_Gun_Prev_f },
     { "gun_model", V_Gun_Model_f },
     { "viewpos", V_Viewpos_f },
+    { "fog", V_Fog_f },
     { NULL }
 };
 

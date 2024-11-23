@@ -22,6 +22,7 @@ with this program; if not, write to the Free Software Foundation, Inc.,
 
 #include "shared/shared.h"
 #include "shared/list.h"
+#include "shared/game.h"
 
 #include "common/bsp.h"
 #include "common/cmd.h"
@@ -37,6 +38,7 @@ with this program; if not, write to the Free Software Foundation, Inc.,
 #include "common/pmove.h"
 #include "common/prompt.h"
 #include "common/protocol.h"
+#include "common/q2proto_shared.h"
 #include "common/sizebuf.h"
 #include "common/zone.h"
 
@@ -51,28 +53,17 @@ with this program; if not, write to the Free Software Foundation, Inc.,
 #include "client/ui.h"
 #include "client/video.h"
 
+#include "q2proto/q2proto.h"
+
 #if USE_ZLIB
 #include <zlib.h>
 #endif
 
 //=============================================================================
 
-// Hack to merge two structures AND still allow to address them separately.
-// Requires non-standard Microsoft extension to compile. FIXME: remove this?
-typedef union {
-    struct {
-        entity_state_t;
-        entity_state_extension_t;
-    };
-    struct {
-        entity_state_t s;
-        entity_state_extension_t x;
-    };
-} centity_state_t;
-
-typedef struct centity_s {
-    centity_state_t     current;
-    centity_state_t     prev;           // will always be valid, but might just be a copy of current
+typedef struct {
+    entity_state_t     current;
+    entity_state_t     prev;           // will always be valid, but might just be a copy of current
 
     vec3_t          mins, maxs;
     float           radius;             // from mid point
@@ -92,18 +83,25 @@ typedef struct centity_s {
     int             fly_stoptime;
 
     float           flashlightfrac;
+
+// KEX
+    int32_t         current_frame, last_frame, frame_servertime;
+    int             stair_time;
+    float           stair_height;
+// KEX
 } centity_t;
 
 extern centity_t    cl_entities[MAX_EDICTS];
 
 #define MAX_CLIENTWEAPONMODELS        256       // PGM -- upped from 16 to fit the chainfist vwep
 
-typedef struct clientinfo_s {
+typedef struct {
     char name[MAX_QPATH];
     qhandle_t skin;
-    qhandle_t icon;
+    char icon_name[MAX_QPATH];
     char model_name[MAX_QPATH];
     char skin_name[MAX_QPATH];
+    char dogtag_name[MAX_QPATH];
     qhandle_t model;
     qhandle_t weaponmodel[MAX_CLIENTWEAPONMODELS];
 } clientinfo_t;
@@ -127,7 +125,7 @@ typedef struct {
     int             clientNum;
 
     int             numEntities;
-    int             firstEntity;
+    unsigned        firstEntity;
 } server_frame_t;
 
 // locally calculated frame flags for debug display
@@ -138,29 +136,98 @@ typedef struct {
 #define FF_NODELTA      BIT(8)
 
 // variable server FPS
-#if USE_FPS
 #define CL_FRAMETIME    cl.frametime.time
 #define CL_1_FRAMETIME  cl.frametime_inv
 #define CL_FRAMEDIV     cl.frametime.div
+#if USE_FPS
 #define CL_FRAMESYNC    !(cl.frame.number % cl.frametime.div)
 #define CL_KEYPS        &cl.keyframe.ps
 #define CL_OLDKEYPS     &cl.oldkeyframe.ps
 #define CL_KEYLERPFRAC  cl.keylerpfrac
 #else
-#define CL_FRAMETIME    BASE_FRAMETIME
-#define CL_1_FRAMETIME  BASE_1_FRAMETIME
-#define CL_FRAMEDIV     1
 #define CL_FRAMESYNC    1
 #define CL_KEYPS        &cl.frame.ps
 #define CL_OLDKEYPS     &cl.oldframe.ps
 #define CL_KEYLERPFRAC  cl.lerpfrac
 #endif
 
+// Time over which step climbing is smoothed
+#define STEP_TIME       100
+
+typedef struct {
+    int         main;
+    int         wheel;
+    int         selected;
+} cl_wheel_icon_t;
+
+typedef struct {
+    int             item_index;
+    cl_wheel_icon_t icons;
+    int             ammo_index;
+    int             min_ammo;
+    int             sort_id;
+    int             quantity_warn;
+    bool            is_powerup;
+    bool            can_drop;
+} cl_wheel_weapon_t;
+
+typedef struct {
+    int             item_index;
+    cl_wheel_icon_t icons;
+} cl_wheel_ammo_t;
+
+typedef struct {
+    int             item_index;
+    cl_wheel_icon_t icons;
+    int             sort_id;
+    int             ammo_index;
+    bool            is_toggle;
+    bool            can_drop;
+} cl_wheel_powerup_t;
+
+typedef enum {
+    WHEEL_CLOSED,   // release holster
+    WHEEL_CLOSING,  // do not draw or process, but keep holster held
+    WHEEL_OPEN      // draw & process + holster
+} cl_wheel_state_t;
+
+typedef struct {
+    bool                  has_item;
+    bool                  is_powerup;
+    bool                  has_ammo;
+    int                   data_id;
+    int                   item_index;
+    int                   sort_id;
+    const cl_wheel_icon_t *icons;
+
+    // cached data
+    float   angle;
+    vec2_t  dir;
+    float   dot;
+} cl_wheel_slot_t;
+
+typedef struct {
+    player_fog_t linear;
+    player_heightfog_t height;
+} cl_fog_params_t;
+
+typedef struct {
+    vec3_t      origin;
+    float       radius;
+    int         resolution;
+    float       intensity;
+    float       fade_start, fade_end;
+    int         lightstyle;
+    float       coneangle; // spot if non-zero
+    vec3_t      conedirection;
+    color_t     color;
+} cl_shadow_light_t;
+
 //
 // the client_state_t structure is wiped completely at every
 // server map change
 //
-typedef struct client_state_s {
+typedef struct {
     int         timeoutcount;
 
     unsigned    lastTransmitTime;
@@ -171,33 +238,42 @@ typedef struct client_state_s {
     usercmd_t    cmd;
     usercmd_t    cmds[CMD_BACKUP];    // each mesage will send several old cmds
     unsigned     cmdNumber;
-    short        predicted_origins[CMD_BACKUP][3];    // for debug comparing against server
+    vec3_t       predicted_origins[CMD_BACKUP];    // for debug comparing against server
     client_history_t    history[CMD_BACKUP];
-    int         initialSeq;
+    unsigned    initialSeq;
 
     float       predicted_step;                // for stair up smoothing
     unsigned    predicted_step_time;
-    unsigned    predicted_step_frame;
 
     vec3_t      predicted_origin;    // generated by CL_PredictMovement
     vec3_t      predicted_angles;
     vec3_t      predicted_velocity;
+    vec4_t      predicted_screen_blend;
+    refdef_flags_t predicted_rdflags;
     vec3_t      prediction_error;
+
+    int8_t      current_viewheight; // current viewheight from client Pmove()
+    int8_t      prev_viewheight;    // viewheight before last change
+    int         viewheight_change_time; // time when a viewheight change was detected
+
+    edict_t     *last_groundentity; // last groundentity reported by pmove
+    cplane_t    last_groundplane; // last groundplane reported by pmove
 
     // rebuilt each valid frame
     centity_t       *solidEntities[MAX_PACKET_ENTITIES];
     int             numSolidEntities;
 
-    centity_state_t baselines[MAX_EDICTS];
+    entity_state_t  baselines[MAX_EDICTS];
 
-    centity_state_t entityStates[MAX_PARSE_ENTITIES];
-    int             numEntityStates;
+    entity_state_t  entityStates[MAX_PARSE_ENTITIES];
+    unsigned        numEntityStates;
 
     msgEsFlags_t    esFlags;
     msgPsFlags_t    psFlags;
 
     server_frame_t  frames[UPDATE_BACKUP];
     unsigned        frameflags;
+    int             suppress_count;
 
     server_frame_t  frame;                // received from server
     server_frame_t  oldframe;
@@ -210,7 +286,7 @@ typedef struct client_state_s {
     int             keyservertime;
 #endif
 
-    byte            dcs[CS_BITMAP_BYTES];
+    size_t          dcs[BC_COUNT(MAX_CONFIGSTRINGS)];
 
     // the client maintains its own idea of view angles, which are
     // sent to the server each frame.  It is cleared to 0 upon entering each level.
@@ -221,7 +297,7 @@ typedef struct client_state_s {
 
     // interpolated movement vector used for local prediction,
     // never sent to server, rebuilt each client frame
-    vec3_t      localmove;
+    vec2_t      localmove;
 
     // accumulated mouse forward/side movement, added to both
     // localmove and pending cmd, cleared each time cmd is finalized
@@ -252,8 +328,7 @@ typedef struct client_state_s {
     //
     // transient data from server
     //
-    char        layout[MAX_NET_STRING];     // general 2D overlay
-    int         inventory[MAX_ITEMS];
+    cg_server_data_t cgame_data;
 
     //
     // server state information
@@ -265,14 +340,13 @@ typedef struct client_state_s {
     int         maxclients;
     pmoveParams_t pmp;
 
-#if USE_FPS
     frametime_t frametime;
     float       frametime_inv;  // 1/frametime
-#endif
 
     configstring_t  baseconfigstrings[MAX_CONFIGSTRINGS];
     configstring_t  configstrings[MAX_CONFIGSTRINGS];
     cs_remap_t      csr;
+    q2proto_game_type_t game_type;
 
     char        mapname[MAX_QPATH]; // short format - q2dm1, etc
 
@@ -287,21 +361,29 @@ typedef struct client_state_s {
     bsp_t        *bsp;
 
     qhandle_t model_draw[MAX_MODELS];
-    mmodel_t *model_clip[MAX_MODELS];
+    const mmodel_t *model_clip[MAX_MODELS];
 
     qhandle_t sound_precache[MAX_SOUNDS];
     qhandle_t image_precache[MAX_IMAGES];
+    qhandle_t sfx_hit_marker;
 
     clientinfo_t    clientinfo[MAX_CLIENTS];
     clientinfo_t    baseclientinfo;
 
     char    weaponModels[MAX_CLIENTWEAPONMODELS][MAX_QPATH];
     int     numWeaponModels;
-
+    
     bool    need_powerscreen_scale;
+
+    int hit_marker_frame;
+    unsigned hit_marker_time;
+    int hit_marker_count;
 
     // data for view weapon
     struct {
+        int32_t frame, last_frame;
+        int32_t server_time;
+
         struct {
             qhandle_t   model;
             int         time;
@@ -309,6 +391,64 @@ typedef struct client_state_s {
             vec3_t      offset;
         } muzzle;
     } weapon;
+
+    struct {
+        cl_fog_params_t     start, end;
+        int                 lerp_time, lerp_time_start;
+    } fog;
+
+    // data for weapon wheel stuff
+    struct {
+        cl_wheel_weapon_t weapons[MAX_WHEEL_ITEMS];
+        int               num_weapons;
+
+        cl_wheel_ammo_t ammo[MAX_WHEEL_ITEMS];
+        int             num_ammo;
+
+        cl_wheel_powerup_t powerups[MAX_WHEEL_ITEMS];
+        int                num_powerups;
+    } wheel_data;
+
+    // carousel state
+    struct {
+        cl_wheel_state_t state;
+        int              close_time; // time when we will close
+        int              selected; // selected item index
+
+        struct {
+            bool    has_ammo;
+            int     data_id;
+            int     item_index;
+        } slots[MAX_WHEEL_ITEMS * 2];
+        size_t      num_slots;
+    } carousel;
+
+    // weapon wheel state
+    struct {
+        cl_wheel_state_t state;
+        vec2_t           position;
+        float            distance;
+        vec2_t           dir;
+        bool             is_powerup_wheel;
+        float            timer, timescale;
+
+        cl_wheel_slot_t slots[MAX_WHEEL_ITEMS * 2];
+        size_t          num_slots;
+
+        float       slice_deg;
+        float       slice_sin;
+
+        int         selected; // -1 = no selection
+        int         deselect_time; // if non-zero, deselect after < com_localTime
+    } wheel;
+
+    int weapon_lock_time; // don't allow BUTTON_ATTACK within this time
+
+    // shadow lights
+    struct {
+        int                 number;
+        cl_shadow_light_t   light;
+    } shadowdefs[MAX_SHADOW_LIGHTS];
 } client_state_t;
 
 extern client_state_t   cl;
@@ -378,7 +518,7 @@ typedef struct {
     byte        data[1];
 } demosnap_t;
 
-typedef struct client_static_s {
+typedef struct {
     connstate_t state;
     keydest_t   key_dest;
 
@@ -392,7 +532,6 @@ typedef struct client_static_s {
 // this is set each time a CVAR_USERINFO variable is changed
 // so that the client knows to send it to the server
 
-    int         framecount;
     unsigned    realtime;           // always increasing, no clamping, etc
     float       frametime;          // seconds since last frame
 
@@ -428,6 +567,7 @@ typedef struct client_static_s {
     netchan_t   netchan;
     int         serverProtocol;     // in case we are doing some kind of version hack
     int         protocolVersion;    // minor version
+    q2proto_clientcontext_t q2proto_ctx;
 
     int         challenge;          // from the server to use for connecting
 
@@ -439,7 +579,7 @@ typedef struct client_static_s {
 #define RECENT_MASK (RECENT_ADDR - 1)
 
     netadr_t    recent_addr[RECENT_ADDR];
-    int         recent_head;
+    unsigned    recent_head;
 
     string_entry_t  *stufftextwhitelist;
 
@@ -451,9 +591,6 @@ typedef struct client_static_s {
         int64_t     position;           // how much downloaded (in bytes)
         qhandle_t   file;               // UDP file transfer from server
         char        temp[MAX_QPATH + 4];// account 4 bytes for .tmp suffix
-#if USE_ZLIB
-        z_stream    z;                  // UDP download zlib stream
-#endif
         string_entry_t  *ignores;       // list of ignored paths
     } download;
 
@@ -478,7 +615,13 @@ typedef struct client_static_s {
         bool        paused;
         bool        seeking;
         bool        eof;
+        bool        compat;             // demomap compatibility mode
         msgEsFlags_t    esFlags;        // for snapshots/recording
+        msgPsFlags_t    psFlags;
+
+        // q2proto fields
+        q2proto_server_info_t server_info;
+        q2proto_servercontext_t q2proto_context;
     } demo;
 
 #if USE_CLIENT_GTV
@@ -490,7 +633,9 @@ typedef struct client_static_s {
 
         player_packed_t     ps;
         entity_packed_t     entities[MAX_EDICTS];
+        msgPsFlags_t        psFlags;
         msgEsFlags_t        esFlags;    // for writing
+        msgPsFlags_t        psFlags;
 
         sizebuf_t       message;
     } gtv;
@@ -504,18 +649,18 @@ extern char         cl_cmdbuf_text[MAX_STRING_CHARS];
 
 //=============================================================================
 
-#define NOPART_GRENADE_EXPLOSION    1
-#define NOPART_GRENADE_TRAIL        2
-#define NOPART_ROCKET_EXPLOSION     4
-#define NOPART_ROCKET_TRAIL         8
-#define NOPART_BLOOD                16
+#define NOPART_GRENADE_EXPLOSION    BIT(0)
+#define NOPART_GRENADE_TRAIL        BIT(1)
+#define NOPART_ROCKET_EXPLOSION     BIT(2)
+#define NOPART_ROCKET_TRAIL         BIT(3)
+#define NOPART_BLOOD                BIT(4)
 
-#define NOEXP_GRENADE   1
-#define NOEXP_ROCKET    2
+#define NOEXP_GRENADE               BIT(0)
+#define NOEXP_ROCKET                BIT(1)
 
-#define DLHACK_ROCKET_COLOR         1
-#define DLHACK_SMALLER_EXPLOSION    2
-#define DLHACK_NO_MUZZLEFLASH       4
+#define DLHACK_ROCKET_COLOR         BIT(0)
+#define DLHACK_SMALLER_EXPLOSION    BIT(1)
+#define DLHACK_NO_MUZZLEFLASH       BIT(2)
 
 //
 // cvars
@@ -533,6 +678,7 @@ extern cvar_t   *cl_rollhack;
 extern cvar_t   *cl_noglow;
 extern cvar_t   *cl_nobob;
 extern cvar_t   *cl_nolerp;
+extern cvar_t   *cl_shadowlights;
 
 #if USE_DEBUG
 #define SHOWNET(level, ...) \
@@ -582,6 +728,7 @@ extern cvar_t   *cl_async;
 extern cvar_t   *info_password;
 extern cvar_t   *info_spectator;
 extern cvar_t   *info_name;
+extern cvar_t   *info_dogtag;
 extern cvar_t   *info_skin;
 extern cvar_t   *info_rate;
 extern cvar_t   *info_fov;
@@ -623,6 +770,7 @@ void CL_SendRcon(const netadr_t *adr, const char *pass, const char *cmd);
 const char *CL_Server_g(const char *partial, int argnum, int state);
 void CL_CheckForPause(void);
 void CL_UpdateFrameTimes(void);
+void CL_AddHitMarker(void);
 bool CL_CheckForIgnore(const char *s);
 void CL_LoadFilterList(string_entry_t **list, const char *name, const char *comments, size_t maxlen);
 
@@ -641,7 +789,7 @@ typedef enum {
     LOAD_SOUNDS
 } load_state_t;
 
-void CL_ParsePlayerSkin(char *name, char *model, char *skin, const char *s);
+void CL_ParsePlayerSkin(char *name, char *model, char *skin, char *dogtag, bool parse_dogtag, const char *s);
 void CL_LoadClientinfo(clientinfo_t *ci, const char *s);
 void CL_LoadState(load_state_t state);
 void CL_RegisterSounds(void);
@@ -649,7 +797,6 @@ void CL_RegisterBspModels(void);
 void CL_RegisterVWepModels(void);
 void CL_PrepRefresh(void);
 void CL_UpdateConfigstring(int index);
-
 
 //
 // download.c
@@ -659,7 +806,7 @@ bool CL_IgnoreDownload(const char *path);
 void CL_FinishDownload(dlqueue_t *q);
 void CL_CleanupDownloads(void);
 void CL_LoadDownloadIgnores(void);
-void CL_HandleDownload(byte *data, int size, int percent, int decompressed_size);
+void CL_HandleDownload(const byte *data, int size, int percent);
 bool CL_CheckDownloadExtension(const char *ext);
 void CL_StartNextDownload(void);
 void CL_RequestNextDownload(void);
@@ -688,6 +835,9 @@ void CL_SendCmd(void);
 #define CL_ES_EXTENDED_MASK \
     (MSG_ES_LONGSOLID | MSG_ES_UMASK | MSG_ES_BEAMORIGIN | MSG_ES_SHORTANGLES | MSG_ES_EXTENSIONS)
 
+#define CL_ES_EXTENDED_MASK_2 (CL_ES_EXTENDED_MASK | MSG_ES_EXTENSIONS_2)
+#define CL_PS_EXTENDED_MASK_2 (MSG_PS_EXTENSIONS | MSG_PS_EXTENSIONS_2 | MSG_PS_MOREBITS)
+
 typedef struct {
     int type;
     vec3_t pos1;
@@ -707,20 +857,9 @@ typedef struct {
     bool silenced;
 } mz_params_t;
 
-typedef struct {
-    int     flags;
-    int     index;
-    int     entity;
-    int     channel;
-    vec3_t  pos;
-    float   volume;
-    float   attenuation;
-    float   timeofs;
-} snd_params_t;
-
 extern tent_params_t    te;
 extern mz_params_t      mz;
-extern snd_params_t     snd;
+extern q2proto_sound_t  snd;
 
 void CL_ParseServerMessage(void);
 bool CL_SeekDemoMessage(void);
@@ -734,6 +873,9 @@ bool CL_SeekDemoMessage(void);
                          EF_FLIES | EF_BFG | EF_TRAP | EF_FLAG1 | EF_FLAG2 | EF_TAGTRAIL | \
                          EF_TRACKERTRAIL | EF_TRACKER | EF_GREENGIB | EF_IONRIPPER | \
                          EF_BLUEHYPERBLASTER | EF_PLASMA)
+
+#define IS_TRACKER(effects) \
+    (((effects) & (EF_TRACKERTRAIL | EF_TRACKER)) == EF_TRACKERTRAIL)
 
 void CL_DeltaFrame(void);
 void CL_AddEntities(void);
@@ -757,12 +899,29 @@ extern qhandle_t    gun_model;
 void V_Init(void);
 void V_Shutdown(void);
 void V_RenderView(void);
-void V_AddEntity(entity_t *ent);
-void V_AddParticle(particle_t *p);
+void V_AddEntity(const entity_t *ent);
+void V_AddParticle(const particle_t *p);
+void V_AddLightEx(cl_shadow_light_t *light);
 void V_AddLight(const vec3_t org, float intensity, float r, float g, float b);
 void V_AddLightStyle(int style, float value);
 void CL_UpdateBlendSetting(void);
+void V_FogParamsChanged(unsigned bits, unsigned color_bits, unsigned hf_start_color_bits, unsigned hf_end_color_bits, const cl_fog_params_t *params, int time);
 
+// wheel.c
+void CL_Wheel_WeapNext(void);
+void CL_Wheel_WeapPrev(void);
+void CL_Carousel_Draw(void);
+void CL_Carousel_Input(void);
+void CL_Carousel_ClearInput(void);
+void CL_Wheel_Precache(void);
+void CL_Wheel_Init(void);
+void CL_Wheel_Open(bool powerup);
+void CL_Wheel_Close(bool released);
+void CL_Wheel_Input(int x, int y);
+void CL_Wheel_Draw(void);
+void CL_Wheel_Update(void);
+void CL_Wheel_ClearInput(void);
+float CL_Wheel_TimeScale(void);
 
 //
 // tent.c
@@ -800,9 +959,10 @@ typedef enum {
 
 void CL_AddWeaponMuzzleFX(cl_muzzlefx_t fx, const vec3_t offset, float scale);
 void CL_AddMuzzleFX(const vec3_t origin, const vec3_t angles, cl_muzzlefx_t fx, int skin, float scale);
+void CL_AddHelpPath(const vec3_t origin, const vec3_t dir, bool first);
 
 void CL_SmokeAndFlash(const vec3_t origin);
-void CL_DrawBeam(const vec3_t org, const vec3_t end, qhandle_t model);
+void CL_DrawBeam(const vec3_t org, const vec3_t end, float model_length, qhandle_t model);
 void CL_PlayFootstepSfx(int step_id, int entnum, float volume, float attenuation);
 
 void CL_RegisterTEntSounds(void);
@@ -819,53 +979,63 @@ void CL_InitTEnts(void);
 void CL_PredictAngles(void);
 void CL_PredictMovement(void);
 void CL_CheckPredictionError(void);
-void CL_Trace(trace_t *tr, const vec3_t start, const vec3_t mins, const vec3_t maxs, const vec3_t end, int contentmask);
+void CL_Trace(trace_t *tr, const vec3_t start, const vec3_t end, const vec3_t mins, const vec3_t maxs, const struct edict_s *passent, contents_t contentmask);
 
 
 //
 // effects.c
 //
-#define PARTICLE_GRAVITY        40
-#define BLASTER_PARTICLE_COLOR  0xe0
+#define PARTICLE_GRAVITY    40
 #define INSTANT_PARTICLE    -10000.0f
 
 typedef struct cparticle_s {
     struct cparticle_s    *next;
 
-    float   time;
-
+    int     time;
     vec3_t  org;
     vec3_t  vel;
     vec3_t  accel;
     int     color;      // -1 => use rgba
+    float   scale;
     float   alpha;
     float   alphavel;
     color_t rgba;
 } cparticle_t;
 
-typedef struct cdlight_s {
+typedef struct {
     int     key;        // so entities can reuse same entry
     vec3_t  color;
     vec3_t  origin;
     float   radius;
-    float   die;        // stop lighting after this time
+    int     die;        // stop lighting after this time
+    int     start;
+    bool    fade;
 } cdlight_t;
 
+typedef enum {
+    DT_GIB,
+    DT_GREENGIB,
+    DT_ROCKET,
+    DT_GRENADE,
+    DT_FIREBALL,
+
+    DT_COUNT
+} diminishing_trail_t;
+
 void CL_BigTeleportParticles(const vec3_t org);
-void CL_RocketTrail(const vec3_t start, const vec3_t end, centity_t *old);
-void CL_DiminishingTrail(const vec3_t start, const vec3_t end, centity_t *old, int flags);
+void CL_DiminishingTrail(centity_t *ent, const vec3_t end, diminishing_trail_t type);
 void CL_FlyEffect(centity_t *ent, const vec3_t origin);
-void CL_BfgParticles(entity_t *ent);
+void CL_BfgParticles(const entity_t *ent);
 void CL_ItemRespawnParticles(const vec3_t org);
 void CL_InitEffects(void);
 void CL_ClearEffects(void);
 void CL_BlasterParticles(const vec3_t org, const vec3_t dir);
 void CL_ExplosionParticles(const vec3_t org);
 void CL_BFGExplosionParticles(const vec3_t org);
-void CL_BlasterTrail(const vec3_t start, const vec3_t end);
+void CL_BlasterTrail(centity_t *ent, const vec3_t end);
 void CL_OldRailTrail(void);
 void CL_BubbleTrail(const vec3_t start, const vec3_t end);
-void CL_FlagTrail(const vec3_t start, const vec3_t end, int color);
+void CL_FlagTrail(centity_t *ent, const vec3_t end, int color);
 void CL_MuzzleFlash(void);
 void CL_MuzzleFlash2(void);
 void CL_TeleporterParticles(const vec3_t org);
@@ -878,21 +1048,22 @@ cdlight_t *CL_AllocDlight(int key);
 void CL_AddDLights(void);
 void CL_SetLightStyle(int index, const char *s);
 void CL_AddLightStyles(void);
+void CL_AddShadowLights(void);
 
 //
 // newfx.c
 //
 
 void CL_BlasterParticles2(const vec3_t org, const vec3_t dir, unsigned int color);
-void CL_BlasterTrail2(const vec3_t start, const vec3_t end);
+void CL_BlasterTrail2(centity_t *ent, const vec3_t end);
 void CL_DebugTrail(const vec3_t start, const vec3_t end);
 void CL_Flashlight(int ent, const vec3_t pos);
 void CL_ForceWall(const vec3_t start, const vec3_t end, int color);
 void CL_BubbleTrail2(const vec3_t start, const vec3_t end, int dist);
 void CL_Heatbeam(const vec3_t start, const vec3_t end);
 void CL_ParticleSteamEffect(const vec3_t org, const vec3_t dir, int color, int count, int magnitude);
-void CL_TrackerTrail(const vec3_t start, const vec3_t end, int particleColor);
-void CL_TagTrail(const vec3_t start, const vec3_t end, int color);
+void CL_TrackerTrail(centity_t *ent, const vec3_t end);
+void CL_TagTrail(centity_t *ent, const vec3_t end, int color);
 void CL_ColorFlash(const vec3_t pos, int ent, int intensity, float r, float g, float b);
 void CL_Tracker_Shell(const centity_t *cent, const vec3_t origin);
 void CL_MonsterPlasma_Shell(const vec3_t origin);
@@ -901,7 +1072,7 @@ void CL_ParticleSmokeEffect(const vec3_t org, const vec3_t dir, int color, int c
 void CL_Widowbeamout(cl_sustain_t *self);
 void CL_Nukeblast(cl_sustain_t *self);
 void CL_WidowSplash(void);
-void CL_IonripperTrail(const vec3_t start, const vec3_t end);
+void CL_IonripperTrail(centity_t *ent, const vec3_t end);
 void CL_TrapParticles(centity_t *ent, const vec3_t origin);
 void CL_ParticleEffect3(const vec3_t org, const vec3_t dir, int color, int count);
 void CL_ParticleSteamEffect2(cl_sustain_t *self);
@@ -919,13 +1090,16 @@ void CL_InitDemos(void);
 void CL_CleanupDemos(void);
 void CL_DemoFrame(int msec);
 bool CL_WriteDemoMessage(sizebuf_t *buf);
-void CL_PackEntity(entity_packed_t *out, const centity_state_t *in);
+void CL_PackEntity(entity_packed_t *out, const entity_state_t *in);
 void CL_EmitDemoFrame(void);
 void CL_EmitDemoSnapshot(void);
 void CL_FreeDemoSnapshots(void);
 void CL_FirstDemoFrame(void);
 void CL_Stop_f(void);
-demoInfo_t *CL_GetDemoInfo(const char *path, demoInfo_t *info);
+bool CL_GetDemoInfo(const char *path, demoInfo_t *info);
+
+extern q2protoio_ioarg_t demo_q2protoio_ioarg;
+#define Q2PROTO_IOARG_DEMO_WRITE    ((uintptr_t)&demo_q2protoio_ioarg)
 
 
 //
@@ -934,7 +1108,6 @@ demoInfo_t *CL_GetDemoInfo(const char *path, demoInfo_t *info);
 void LOC_Init(void);
 void LOC_LoadLocations(void);
 void LOC_FreeLocations(void);
-void LOC_UpdateCvars(void);
 void LOC_AddLocationsToScene(void);
 
 
@@ -973,13 +1146,82 @@ void    CL_RunRefresh(void);
 //
 // screen.c
 //
-extern vrect_t      scr_vrect;        // position of render window
+#define STAT_PICS       11
+#define STAT_MINUS      (STAT_PICS - 1)  // num frame for '-' stats digit
+
+typedef struct {
+    int         damage;
+    vec3_t      color;
+    vec3_t      dir;
+    int         time;
+} scr_damage_entry_t;
+
+#define MAX_DAMAGE_ENTRIES      32
+#define DAMAGE_ENTRY_BASE_SIZE  3
+
+typedef struct {
+    int         id;
+    int         time;
+    int         color;
+    int         flags;
+    qhandle_t   image;
+    int         width, height;
+    vec3_t      position;
+} scr_poi_t;
+
+#define MAX_TRACKED_POIS        32
+
+typedef struct {
+    bool        initialized;        // ready to draw
+
+    qhandle_t   crosshair_pic;
+    int         crosshair_width, crosshair_height;
+    color_t     crosshair_color;
+
+    qhandle_t   pause_pic;
+
+    qhandle_t   loading_pic;
+    bool        draw_loading;
+
+    qhandle_t   hit_marker_pic;
+    int         hit_marker_time;
+    int         hit_marker_width, hit_marker_height;
+
+    qhandle_t   damage_display_pic;
+    int         damage_display_width, damage_display_height;
+    scr_damage_entry_t  damage_entries[MAX_DAMAGE_ENTRIES];
+
+    scr_poi_t   pois[MAX_TRACKED_POIS];
+
+    qhandle_t   sb_pics[2][STAT_PICS];
+    qhandle_t   inven_pic;
+    qhandle_t   field_pic;
+
+    qhandle_t   backtile_pic;
+
+    qhandle_t   net_pic;
+    qhandle_t   font_pic;
+
+    int         hud_width, hud_height;
+    float       hud_scale;
+    vrect_t     vrect;        // position of render window
+    
+    kfont_t     kfont;
+
+    qhandle_t   carousel_selected;
+    qhandle_t   wheel_circle;
+    int         wheel_size;
+    qhandle_t   wheel_button;
+    int         wheel_button_size;
+} cl_scr_t;
+
+extern cl_scr_t scr;
 
 void    SCR_Init(void);
 void    SCR_Shutdown(void);
 void    SCR_UpdateScreen(void);
-void    SCR_CenterPrint(const char *str, bool typewrite);
-void    SCR_ClearCenterPrints(void);
+void    SCR_SizeUp(void);
+void    SCR_SizeDown(void);
 void    SCR_BeginLoadingPlaque(void);
 void    SCR_EndLoadingPlaque(void);
 void    SCR_RegisterMedia(void);
@@ -987,15 +1229,23 @@ void    SCR_ModeChanged(void);
 void    SCR_LagSample(void);
 void    SCR_LagClear(void);
 void    SCR_SetCrosshairColor(void);
+void    SCR_AddNetgraph(void);
 
 float   SCR_FadeAlpha(unsigned startTime, unsigned visTime, unsigned fadeTime);
-int     SCR_DrawStringEx(int x, int y, int flags, size_t maxlen, const char *s, qhandle_t font);
-void    SCR_DrawStringMulti(int x, int y, int flags, size_t maxlen, const char *s, qhandle_t font);
+#define SCR_DrawString(x, y, flags, color, string) \
+    SCR_DrawStringEx(x, y, flags, MAX_STRING_CHARS, string, color, scr.font_pic)
+int     SCR_DrawStringEx(int x, int y, int flags, size_t maxlen, const char *s, color_t color, qhandle_t font);
+void    SCR_DrawStringMulti(int x, int y, int flags, size_t maxlen, const char *s, color_t color, qhandle_t font);
 
 void    SCR_ClearChatHUD_f(void);
 void    SCR_AddToChatHUD(const char *text);
 
 int     SCR_GetCinematicCrop(unsigned framenum, int64_t filesize);
+
+void    SCR_AddToDamageDisplay(int damage, const vec3_t color, const vec3_t dir);
+void    SCR_RemovePOI(int id);
+void    SCR_AddPOI(int id, int time, const vec3_t p, int image, int color, int flags);
+void    SCR_Clear(void);
 
 //
 // cin.c
@@ -1050,7 +1300,7 @@ void HTTP_CleanupDownloads(void);
 
 #if USE_CLIENT_GTV
 void CL_GTV_EmitFrame(void);
-void CL_GTV_WriteMessage(byte *data, size_t len);
+void CL_GTV_WriteMessage(const byte *data, size_t len);
 void CL_GTV_Resume(void);
 void CL_GTV_Suspend(void);
 void CL_GTV_Transmit(void);
@@ -1071,4 +1321,14 @@ void CL_GTV_Shutdown(void);
 //
 // crc.c
 //
-byte COM_BlockSequenceCRCByte(byte *base, size_t length, int sequence);
+byte COM_BlockSequenceCRCByte(const byte *base, size_t length, int sequence);
+
+//
+// cgame.c
+//
+
+extern const cgame_export_t *cgame;
+
+void CG_Init(void);
+void CG_Load(const char* new_game, bool is_rerelease_server);
+void CG_Unload(void);

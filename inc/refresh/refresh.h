@@ -29,22 +29,7 @@ with this program; if not, write to the Free Software Foundation, Inc.,
 #define POWERSUIT_SCALE     4.0f
 #define WEAPONSHELL_SCALE   0.5f
 
-#define SHELL_RED_COLOR     0xF2
-#define SHELL_GREEN_COLOR   0xD0
-#define SHELL_BLUE_COLOR    0xF3
-
-#define SHELL_RG_COLOR      0xDC
-//#define SHELL_RB_COLOR        0x86
-#define SHELL_RB_COLOR      0x68
-#define SHELL_BG_COLOR      0x78
-
-//ROGUE
-#define SHELL_DOUBLE_COLOR  0xDF // 223
-#define SHELL_HALF_DAM_COLOR    0x90
-#define SHELL_CYAN_COLOR    0x72
-//ROGUE
-
-#define SHELL_WHITE_COLOR   0xD7
+#define RF_TRACKER          BIT_ULL(32)
 
 #define RF_SHELL_MASK       (RF_SHELL_RED | RF_SHELL_GREEN | RF_SHELL_BLUE | \
                              RF_SHELL_DOUBLE | RF_SHELL_HALF_DAM | RF_SHELL_LITE_GREEN)
@@ -59,13 +44,13 @@ typedef struct entity_s {
     ** most recent data
     */
     vec3_t              origin;     // also used as RF_BEAM's "from"
-    int                 frame;          // also used as RF_BEAM's diameter
+    unsigned            frame;      // also used as RF_BEAM's diameter
 
     /*
     ** previous data for lerping
     */
     vec3_t              oldorigin;  // also used as RF_BEAM's "to"
-    int                 oldframe;
+    unsigned            oldframe;
 
     /*
     ** misc
@@ -77,38 +62,48 @@ typedef struct entity_s {
     float   alpha;                  // ignore if RF_TRANSLUCENT isn't set
     color_t rgba;
 
-    qhandle_t   skin;           // NULL for inline skin
-    int         flags;
+    uint64_t    flags;
 
-    float       scale;
+    qhandle_t   skin;           // NULL for inline skin
+    vec3_t      scale;
+    float       bottom_z; // for shadows
 } entity_t;
 
-typedef struct dlight_s {
+typedef struct {
     vec3_t  origin;
     vec3_t  transformed;
     vec3_t  color;
-    float   intensity;
+    float   radius;
+    float   intensity; // note: this is different than Q2PRO and is a light
+                       // intensity scalar, not a radius!
+    vec4_t  cone;
+    vec2_t  fade;
 } dlight_t;
 
-typedef struct particle_s {
+typedef struct {
     vec3_t  origin;
     int     color;              // -1 => use rgba
+    float   scale;
     float   alpha;
     color_t rgba;
 } particle_t;
 
-typedef struct lightstyle_s {
-    float           white;          // highest of RGB
+typedef struct {
+    float   white;              // highest of RGB
 } lightstyle_t;
 
-typedef struct refdef_s {
+typedef struct {
     int         x, y, width, height;// in virtual screen coordinates
     float       fov_x, fov_y;
     vec3_t      vieworg;
     vec3_t      viewangles;
-    vec4_t      blend;          // rgba 0-1 full screen blend
+    vec4_t      screen_blend;       // rgba 0-1 full screen blend
+    vec4_t      damage_blend;       // rgba 0-1 damage blend
+    player_fog_t        fog;
+    player_heightfog_t  heightfog;
     float       time;               // time is uesed to auto animate
     int         rdflags;            // RDF_UNDERWATER, etc
+    bool        extended;
 
     byte        *areabits;          // if not NULL, only areas with set bits will be drawn
 
@@ -124,12 +119,21 @@ typedef struct refdef_s {
     particle_t  *particles;
 } refdef_t;
 
+enum {
+    QGL_PROFILE_NONE,
+    QGL_PROFILE_CORE,
+    QGL_PROFILE_ES,
+};
+
 typedef struct {
-    int     colorbits;
-    int     depthbits;
-    int     stencilbits;
-    int     multisamples;
-    bool    debug;
+    uint8_t     colorbits;
+    uint8_t     depthbits;
+    uint8_t     stencilbits;
+    uint8_t     multisamples;
+    bool        debug;
+    uint8_t     profile;
+    uint8_t     major_ver;
+    uint8_t     minor_ver;
 } r_opengl_config_t;
 
 typedef enum {
@@ -150,16 +154,25 @@ typedef struct {
 } clipRect_t;
 
 typedef enum {
-    IF_NONE         = 0,
-    IF_PERMANENT    = BIT(0),
-    IF_TRANSPARENT  = BIT(1),
-    IF_PALETTED     = BIT(2),
-    IF_UPSCALED     = BIT(3),
-    IF_SCRAP        = BIT(4),
-    IF_TURBULENT    = BIT(5),
-    IF_REPEAT       = BIT(6),
-    IF_NEAREST      = BIT(7),
-    IF_OPAQUE       = BIT(8),
+    IF_NONE             = 0,
+    IF_PERMANENT        = BIT(0),   // not freed by R_EndRegistration()
+    IF_TRANSPARENT      = BIT(1),   // known to be transparent
+    IF_PALETTED         = BIT(2),   // loaded from 8-bit paletted format
+    IF_UPSCALED         = BIT(3),   // upscaled
+    IF_SCRAP            = BIT(4),   // put in scrap texture
+    IF_TURBULENT        = BIT(5),   // turbulent surface (don't desaturate, etc)
+    IF_REPEAT           = BIT(6),   // tiling image
+    IF_NEAREST          = BIT(7),   // don't bilerp
+    IF_OPAQUE           = BIT(8),   // known to be opaque
+    IF_DEFAULT_FLARE    = BIT(9),   // default flare hack
+    IF_CUBEMAP          = BIT(10),  // cubemap (or part of it)
+    IF_CLASSIC_SKY      = BIT(11),  // split in two halves
+    IF_SPECIAL          = BIT(12),  // 1x1 pixel pure white image
+
+    // these flags only affect R_RegisterImage() behavior,
+    // and are not stored in image
+    IF_OPTIONAL         = BIT(16),  // don't warn if not found
+    IF_KEEP_EXTENSION   = BIT(17),  // don't override extension
 } imageflags_t;
 
 typedef enum {
@@ -205,31 +218,53 @@ void    R_EndRegistration(void);
 #define R_RegisterSkin(name)    R_RegisterImage(name, IT_SKIN, IF_NONE)
 #define R_RegisterSprite(name)  R_RegisterImage(name, IT_SPRITE, IF_NONE)
 
-void    R_RenderFrame(refdef_t *fd);
+void    R_RenderFrame(const refdef_t *fd);
 void    R_LightPoint(const vec3_t origin, vec3_t light);
 
-void    R_ClearColor(void);
-void    R_SetAlpha(float clpha);
-void    R_SetColor(uint32_t color);
 void    R_SetClipRect(const clipRect_t *clip);
 float   R_ClampScale(cvar_t *var);
 void    R_SetScale(float scale);
-void    R_DrawChar(int x, int y, int flags, int ch, qhandle_t font);
+void    R_DrawChar(int x, int y, int flags, int ch, color_t color, qhandle_t font);
+void    R_DrawStretchChar(int x, int y, int w, int h, int flags, int ch, color_t color, qhandle_t font);
 int     R_DrawString(int x, int y, int flags, size_t maxChars,
-                     const char *string, qhandle_t font);  // returns advanced x coord
+                     const char *string, color_t color, qhandle_t font);  // returns advanced x coord
+
+// kfont stuff
+typedef struct {
+    uint16_t    x, y, w, h;
+} kfont_char_t;
+
+#define KFONT_ASCII_MIN         32
+#define KFONT_ASCII_MAX         126
+
+typedef struct {
+    qhandle_t       pic;
+    kfont_char_t    chars[KFONT_ASCII_MAX - KFONT_ASCII_MIN + 1];
+    uint16_t        line_height;
+    float           sw, sh;
+} kfont_t;
+
+const kfont_char_t *SCR_KFontLookup(const kfont_t *kfont, uint32_t codepoint);
+void    SCR_LoadKFont(kfont_t *font, const char *filename);
+int     R_DrawKFontChar(int x, int y, int scale, int flags, uint32_t codepoint, color_t color, const kfont_t *kfont);
+
 bool    R_GetPicSize(int *w, int *h, qhandle_t pic);   // returns transparency bit
-void    R_DrawPic(int x, int y, qhandle_t pic);
-void    R_DrawStretchPic(int x, int y, int w, int h, qhandle_t pic);
-void    R_DrawKeepAspectPic(int x, int y, int w, int h, qhandle_t pic);
+void    R_DrawPic(int x, int y, color_t color, qhandle_t pic);
+void    R_DrawStretchPic(int x, int y, int w, int h, color_t color, qhandle_t pic);
+void    R_DrawStretchRotatePic(int x, int y, int w, int h, color_t color, float angle, int pivot_x, int pivot_y, qhandle_t pic);
+void    R_DrawKeepAspectPic(int x, int y, int w, int h, color_t color, qhandle_t pic);
 void    R_DrawStretchRaw(int x, int y, int w, int h);
 void    R_UpdateRawPic(int pic_w, int pic_h, const uint32_t *pic);
 void    R_TileClear(int x, int y, int w, int h, qhandle_t pic);
 void    R_DrawFill8(int x, int y, int w, int h, int c);
-void    R_DrawFill32(int x, int y, int w, int h, uint32_t color);
+void    R_DrawFill32(int x, int y, int w, int h, color_t color);
 
 // video mode and refresh state management entry points
 void    R_BeginFrame(void);
 void    R_EndFrame(void);
 void    R_ModeChanged(int width, int height, int flags);
 
-r_opengl_config_t *R_GetGLConfig(void);
+void    GL_ExpireDebugObjects(void);
+bool    R_SupportsPerPixelLighting(void);
+
+r_opengl_config_t R_GetGLConfig(void);

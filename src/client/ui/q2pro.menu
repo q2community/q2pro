@@ -51,6 +51,8 @@ begin <menuname>
    blank
 
    field [options] <name> <cvar>
+
+   imagevalues <name> <cvar> <path> <filter> <width> <height>
 end
 */
 
@@ -144,7 +146,8 @@ end
 
 begin crosshair
     title "Crosshair Setup"
-    values "crosshair type" crosshair none cross dot angle
+    //values "crosshair type" crosshair none cross dot angle
+    imagevalues "crosshair type" crosshair "pics" "ch*" 64 64
     pairs "crosshair scale" ch_scale 0.5x 0.5 1x 1 2x 2
     toggle "color by health" ch_health
     range "red channel" ch_red 0 1
@@ -218,13 +221,23 @@ begin multiplayer
     action "start server" pushmenu startserver
 end
 
+begin skill_select
+    banner m_banner_game
+    action easy "forcemenuoff; skill 0; deathmatch 0; coop 0; maxclients 1; _mapdb_run"
+    action medium "forcemenuoff; skill 1; deathmatch 0; coop 0; maxclients 1; _mapdb_run"
+    action hard "forcemenuoff; skill 2; deathmatch 0; coop 0; maxclients 1; _mapdb_run"
+    action nightmare "forcemenuoff; skill 3; deathmatch 0; coop 0; maxclients 1; _mapdb_run"
+end
+
 begin singleplayer
     banner m_banner_game
-    action easy "skill 0; deathmatch 0; coop 0; maxclients 1; newgame"
-    action medium "skill 1; deathmatch 0; coop 0; maxclients 1; newgame"
-    action hard "skill 2; deathmatch 0; coop 0; maxclients 1; newgame"
-    action nightmare "skill 3; deathmatch 0; coop 0; maxclients 1; newgame"
+	episode_selector episode _mapdb_episode
+	action --align "start episode" "set _mapdb_type episode; pushmenu skill_select"
     blank
+	unit_selector level _mapdb_level
+	blank
+	action --align "start level" "set _mapdb_type level; pushmenu skill_select"
+	blank
     action "load game..." pushmenu loadgame
     action "save game..." pushmenu savegame
 end

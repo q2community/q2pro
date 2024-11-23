@@ -29,6 +29,8 @@ static cvar_t   *cl_demomsglen;
 static cvar_t   *cl_demowait;
 static cvar_t   *cl_demosuspendtoggle;
 
+q2protoio_ioarg_t demo_q2protoio_ioarg = {.sz_write = &cls.demo.buffer};
+
 // =========================================================================
 
 /*
@@ -73,9 +75,9 @@ fail:
     return false;
 }
 
-void CL_PackEntity(entity_packed_t *out, const centity_state_t *in)
+void CL_PackEntity(entity_packed_t *out, const entity_state_t *in)
 {
-    MSG_PackEntity(out, &in->s, cl.csr.extended ? &in->x : NULL);
+    MSG_PackEntity(out, in, cl.csr.extended);
 
     // repack solid 32 to 16
     if (!cl.csr.extended && cl.esFlags & MSG_ES_LONGSOLID && in->solid && in->solid != PACKED_BSP) {
@@ -85,11 +87,41 @@ void CL_PackEntity(entity_packed_t *out, const centity_state_t *in)
     }
 }
 
-// writes a delta update of an entity_state_t list to the message.
-static void emit_packet_entities(server_frame_t *from, server_frame_t *to)
+static void CL_PackEntity_q2proto(q2proto_packed_entity_state_t *out, const entity_state_t *in)
 {
-    entity_packed_t oldpack, newpack;
-    centity_state_t *oldent, *newent;
+    PackEntity(&cls.demo.q2proto_context, in, out);
+    // repack solid 32 to 16
+    if (!cl.csr.extended && in->solid && in->solid != PACKED_BSP) {
+        vec3_t mins, maxs;
+        q2proto_client_unpack_solid(&cls.q2proto_ctx, in->solid, mins, maxs);
+        out->solid = q2proto_pack_solid_16(mins, maxs);
+    }
+}
+
+static void write_delta_entity(const q2proto_packed_entity_state_t *oldpack, const q2proto_packed_entity_state_t *newpack, int newnum, msgEsFlags_t flags)
+{
+    q2proto_svc_message_t message_entity_delta = {.type = Q2P_SVC_FRAME_ENTITY_DELTA, .frame_entity_delta = {0}};
+    bool entity_differs = Q2PROTO_MakeEntityDelta(&cls.demo.q2proto_context, &message_entity_delta.frame_entity_delta.entity_delta, oldpack, newpack, flags);
+    message_entity_delta.frame_entity_delta.newnum = newnum;
+
+    if (!(flags & MSG_ES_FORCE) && !entity_differs)
+        return;
+    q2proto_server_write(&cls.demo.q2proto_context, Q2PROTO_IOARG_DEMO_WRITE, &message_entity_delta);
+}
+
+static void write_entity_remove(int num)
+{
+    q2proto_svc_message_t message_entity_delta = {.type = Q2P_SVC_FRAME_ENTITY_DELTA, .frame_entity_delta = {0}};
+    message_entity_delta.frame_entity_delta.remove = true;
+    message_entity_delta.frame_entity_delta.newnum = num;
+    q2proto_server_write(&cls.demo.q2proto_context, Q2PROTO_IOARG_DEMO_WRITE, &message_entity_delta);
+}
+
+// writes a delta update of an entity_state_t list to the message.
+static void emit_packet_entities(const server_frame_t *from, const server_frame_t *to)
+{
+    q2proto_packed_entity_state_t oldpack, newpack;
+    entity_state_t *oldent, *newent;
     int     oldindex, newindex;
     int     oldnum, newnum;
     int     i, from_num_entities;
@@ -128,9 +160,9 @@ static void emit_packet_entities(server_frame_t *from, server_frame_t *to)
             msgEsFlags_t flags = cls.demo.esFlags;
             if (newent->number <= cl.maxclients)
                 flags |= MSG_ES_NEWENTITY;
-            CL_PackEntity(&oldpack, oldent);
-            CL_PackEntity(&newpack, newent);
-            MSG_WriteDeltaEntity(&oldpack, &newpack, flags);
+            CL_PackEntity_q2proto(&oldpack, oldent);
+            CL_PackEntity_q2proto(&newpack, newent);
+            write_delta_entity(&oldpack, &newpack, newnum, flags);
             oldindex++;
             newindex++;
             continue;
@@ -138,52 +170,53 @@ static void emit_packet_entities(server_frame_t *from, server_frame_t *to)
 
         if (newnum < oldnum) {
             // this is a new entity, send it from the baseline
-            CL_PackEntity(&oldpack, &cl.baselines[newnum]);
-            CL_PackEntity(&newpack, newent);
-            MSG_WriteDeltaEntity(&oldpack, &newpack, cls.demo.esFlags | MSG_ES_FORCE | MSG_ES_NEWENTITY);
+            CL_PackEntity_q2proto(&oldpack, &cl.baselines[newnum]);
+            CL_PackEntity_q2proto(&newpack, newent);
+            write_delta_entity(&oldpack, &newpack, newnum, MSG_ES_FORCE | MSG_ES_NEWENTITY);
             newindex++;
             continue;
         }
 
         if (newnum > oldnum) {
             // the old entity isn't present in the new message
-            CL_PackEntity(&oldpack, oldent);
-            MSG_WriteDeltaEntity(&oldpack, NULL, MSG_ES_FORCE);
+            write_entity_remove(oldnum);
             oldindex++;
             continue;
         }
     }
 
-    MSG_WriteShort(0);      // end of packetentities
+    // end of packetentities
+    q2proto_svc_message_t message = {.type = Q2P_SVC_FRAME_ENTITY_DELTA, .frame_entity_delta = {0}};
+    q2proto_server_write(&cls.demo.q2proto_context, Q2PROTO_IOARG_DEMO_WRITE, &message);
 }
 
-static void emit_delta_frame(server_frame_t *from, server_frame_t *to,
+static void emit_delta_frame(const server_frame_t *from, const server_frame_t *to,
                              int fromnum, int tonum)
 {
-    player_packed_t oldpack, newpack;
+    q2proto_svc_message_t message = {.type = Q2P_SVC_FRAME, .frame = {0}};
 
-    MSG_WriteByte(svc_frame);
-    MSG_WriteLong(tonum);
-    MSG_WriteLong(fromnum); // what we are delta'ing from
-    if (cls.serverProtocol != PROTOCOL_VERSION_OLD)
-        MSG_WriteByte(0);   // rate dropped packets
+    message.frame.serverframe = tonum;
+    message.frame.deltaframe = fromnum;
+    message.frame.suppress_count = cl.suppress_count;   // rate dropped packets
+    message.frame.q2pro_frame_flags = 0;
 
-    // send over the areabits
-    MSG_WriteByte(to->areabytes);
-    MSG_WriteData(to->areabits, to->areabytes);
+    message.frame.areabits_len = to->areabytes;
+    message.frame.areabits = to->areabits;
 
-    // delta encode the playerstate
-    MSG_WriteByte(svc_playerinfo);
-    MSG_PackPlayer(&newpack, &to->ps);
+    q2proto_packed_player_state_t newpack, oldpack;
+    PackPlayerstate(&cls.demo.q2proto_context, &to->ps, &newpack);
     if (from) {
-        MSG_PackPlayer(&oldpack, &from->ps);
-        MSG_WriteDeltaPlayerstate_Default(&oldpack, &newpack, cl.psFlags);
-    } else {
-        MSG_WriteDeltaPlayerstate_Default(NULL, &newpack, cl.psFlags);
+        PackPlayerstate(&cls.demo.q2proto_context, &from->ps, &oldpack);
+        q2proto_server_make_player_state_delta(&cls.demo.q2proto_context, &oldpack, &newpack, &message.frame.playerstate);
+    } else
+        q2proto_server_make_player_state_delta(&cls.demo.q2proto_context, NULL, &newpack, &message.frame.playerstate);
+    if ((from ? from->clientNum : 0) != to->clientNum) {
+        message.frame.playerstate.clientnum = to->clientNum;
+        message.frame.playerstate.delta_bits |= Q2P_PSD_CLIENTNUM;
     }
 
-    // delta encode the entities
-    MSG_WriteByte(svc_packetentities);
+    q2proto_server_write(&cls.demo.q2proto_context, Q2PROTO_IOARG_DEMO_WRITE, &message);
+
     emit_packet_entities(from, to);
 }
 
@@ -224,16 +257,19 @@ void CL_EmitDemoFrame(void)
     // emit and flush frame
     emit_delta_frame(oldframe, &cl.frame, lastframe, FRAME_CUR);
 
-    if (cls.demo.buffer.cursize + msg_write.cursize > cls.demo.buffer.maxsize) {
+    if (msg_write.overflowed) {
+        Com_WPrintf("%s: message buffer overflowed\n", __func__);
+    } else if (cls.demo.buffer.cursize + msg_write.cursize > cls.demo.buffer.maxsize) {
         Com_DPrintf("Demo frame overflowed (%u + %u > %u)\n",
                     cls.demo.buffer.cursize, msg_write.cursize, cls.demo.buffer.maxsize);
         cls.demo.frames_dropped++;
 
         // warn the user if drop rate is too high
-        if (cls.demo.frames_written < 10 && cls.demo.frames_dropped == 50)
-            Com_WPrintf("Too many demo frames don't fit into %u bytes.\n"
-                        "Try to increase 'cl_demomsglen' value and restart recording.\n",
-                        cls.demo.buffer.maxsize);
+        if (cls.demo.frames_written < 10 && !(cls.demo.frames_dropped % 50)) {
+            Com_WPrintf("Too many demo frames don't fit into %u bytes!\n", cls.demo.buffer.maxsize);
+            if (cls.demo.frames_dropped == 50)
+                Com_WPrintf("Try to increase 'cl_demomsglen' value and restart recording.\n");
+        }
     } else {
         SZ_Write(&cls.demo.buffer, msg_write.data, msg_write.cursize);
         cls.demo.last_server_frame = cl.frame.number;
@@ -253,7 +289,7 @@ static size_t format_demo_status(char *buffer, size_t size)
     size_t len = format_demo_size(buffer, size);
     int min, sec, frames = cls.demo.frames_written;
 
-    sec = frames / 10; frames %= 10;
+    sec = frames / BASE_FRAMERATE; frames %= BASE_FRAMERATE;
     min = sec / 60; sec %= 60;
 
     len += Q_scnprintf(buffer + len, size - len, ", %d:%02d.%d",
@@ -312,6 +348,91 @@ void CL_Stop_f(void)
     CL_UpdateRecordingSetting();
 }
 
+static void fill_message_fog(q2proto_svc_fog_t *msg_fog, const cl_fog_params_t *client_fog)
+{
+    msg_fog->flags = 0;
+    q2proto_var_color_set_float_comp(&msg_fog->global.color.values, 0, client_fog->linear.color[0]);
+    q2proto_var_color_set_float_comp(&msg_fog->global.color.values, 1, client_fog->linear.color[1]);
+    q2proto_var_color_set_float_comp(&msg_fog->global.color.values, 2, client_fog->linear.color[2]);
+    msg_fog->global.color.delta_bits = BIT(0) | BIT(1) | BIT(2);
+    q2proto_var_fraction_set_float(&msg_fog->global.density, client_fog->linear.density);
+    q2proto_var_fraction_set_float(&msg_fog->global.skyfactor, client_fog->linear.sky_factor);
+    msg_fog->flags |= Q2P_FOG_DENSITY_SKYFACTOR;
+
+    q2proto_var_fraction_set_float(&msg_fog->height.falloff, client_fog->height.falloff);
+    msg_fog->flags |= Q2P_HEIGHTFOG_FALLOFF;
+    q2proto_var_fraction_set_float(&msg_fog->height.density, client_fog->height.density);
+    msg_fog->flags |= Q2P_HEIGHTFOG_DENSITY;
+
+    q2proto_var_color_set_float_comp(&msg_fog->height.start_color.values, 0, client_fog->height.start.color[0]);
+    q2proto_var_color_set_float_comp(&msg_fog->height.start_color.values, 1, client_fog->height.start.color[1]);
+    q2proto_var_color_set_float_comp(&msg_fog->height.start_color.values, 2, client_fog->height.start.color[2]);
+    msg_fog->height.start_color.delta_bits = BIT(0) | BIT(1) | BIT(2);
+    q2proto_var_coord_set_float(&msg_fog->height.start_dist, client_fog->height.start.dist);
+    msg_fog->flags |= Q2P_HEIGHTFOG_START_DIST;
+
+    q2proto_var_color_set_float_comp(&msg_fog->height.end_color.values, 0, client_fog->height.end.color[0]);
+    q2proto_var_color_set_float_comp(&msg_fog->height.end_color.values, 1, client_fog->height.end.color[1]);
+    q2proto_var_color_set_float_comp(&msg_fog->height.end_color.values, 2, client_fog->height.end.color[2]);
+    msg_fog->height.end_color.delta_bits = BIT(0) | BIT(1) | BIT(2);
+    q2proto_var_coord_set_float(&msg_fog->height.end_dist, client_fog->height.end.dist);
+    msg_fog->flags |= Q2P_HEIGHTFOG_END_DIST;
+}
+
+static void write_current_fog(void)
+{
+    q2proto_svc_message_t fog_message = {.type = Q2P_SVC_FOG};
+
+    if (cl.fog.lerp_time == 0 || cl.time > cl.fog.lerp_time_start + cl.fog.lerp_time) {
+        // No fog lerping
+        fill_message_fog(&fog_message.fog, &cl.fog.end);
+        q2proto_server_write(&cls.demo.q2proto_context, Q2PROTO_IOARG_DEMO_WRITE, &fog_message);
+    } else {
+        cl_fog_params_t current_fog;
+
+        int time_since_lerp_start = (cl.time - cl.fog.lerp_time_start);
+        float fog_frontlerp = time_since_lerp_start / (float) cl.fog.lerp_time;
+        float fog_backlerp = 1.0f - fog_frontlerp;
+
+#define Q_FP(p) \
+            current_fog.linear.p = LERP2(cl.fog.start.linear.p, cl.fog.end.linear.p, fog_backlerp, fog_frontlerp)
+#define Q_HFP(p) \
+            current_fog.height.p = LERP2(cl.fog.start.height.p, cl.fog.end.height.p, fog_backlerp, fog_frontlerp)
+
+        Q_FP(color[0]);
+        Q_FP(color[1]);
+        Q_FP(color[2]);
+        Q_FP(density);
+        Q_FP(sky_factor);
+
+        Q_HFP(start.color[0]);
+        Q_HFP(start.color[1]);
+        Q_HFP(start.color[2]);
+        Q_HFP(start.dist);
+
+        Q_HFP(end.color[0]);
+        Q_HFP(end.color[1]);
+        Q_HFP(end.color[2]);
+        Q_HFP(end.dist);
+
+        Q_HFP(density);
+        Q_HFP(falloff);
+
+#undef Q_FP
+#undef Q_HFP
+
+        // Write current fog, as perceived by user
+        fill_message_fog(&fog_message.fog, &current_fog);
+        q2proto_server_write(&cls.demo.q2proto_context, Q2PROTO_IOARG_DEMO_WRITE, &fog_message);
+
+        // Write fog being lerped to
+        fill_message_fog(&fog_message.fog, &cl.fog.end);
+        fog_message.fog.global.time = cl.fog.lerp_time - time_since_lerp_start;
+        fog_message.fog.flags |= Q2P_FOG_TIME;
+        q2proto_server_write(&cls.demo.q2proto_context, Q2PROTO_IOARG_DEMO_WRITE, &fog_message);
+    }
+}
+
 static const cmd_option_t o_record[] = {
     { "h", "help", "display this message" },
     { "z", "compress", "compress demo with gzip" },
@@ -333,10 +454,6 @@ static void CL_Record_f(void)
 {
     char    buffer[MAX_OSPATH];
     int     i, c;
-    size_t  len;
-    centity_state_t *ent;
-    entity_packed_t pack;
-    char            *s;
     qhandle_t       f;
     unsigned        mode = FS_MODE_WRITE;
     size_t          size = Cvar_ClampInteger(
@@ -382,6 +499,21 @@ static void CL_Record_f(void)
         return;
     }
 
+    if (cl.csr.extended)
+        size = MAX_MSGLEN;
+
+    // Set up q2proto structures
+    memset(&cls.demo.server_info, 0, sizeof(cls.demo.server_info));
+    cls.demo.server_info.game_type = cls.q2proto_ctx.features.server_game_type;
+    cls.demo.server_info.default_packet_length = size;
+
+    q2proto_error_t err = q2proto_init_servercontext_demo(&cls.demo.q2proto_context, &cls.demo.server_info, &size);
+    if (err != Q2P_ERR_SUCCESS) {
+        Com_EPrintf("Failed to start demo recording: %d.\n", err);
+        return;
+    }
+    demo_q2protoio_ioarg.max_msg_len = size;
+
     //
     // open the demo file
     //
@@ -399,10 +531,7 @@ static void CL_Record_f(void)
     // the first frame will be delta uncompressed
     cls.demo.last_server_frame = -1;
 
-    if (cl.csr.extended)
-        size = MAX_MSGLEN;
-
-    SZ_Init(&cls.demo.buffer, demo_buffer, size);
+    SZ_InitWrite(&cls.demo.buffer, demo_buffer, size);
 
     // clear dirty configstrings
     memset(cl.dcs, 0, sizeof(cl.dcs));
@@ -410,61 +539,68 @@ static void CL_Record_f(void)
     // tell the server we are recording
     CL_UpdateRecordingSetting();
 
+
+
     //
     // write out messages to hold the startup information
     //
 
     // send the serverdata
-    MSG_WriteByte(svc_serverdata);
-    if (cl.csr.extended)
-        MSG_WriteLong(PROTOCOL_VERSION_EXTENDED);
-    else
-        MSG_WriteLong(min(cls.serverProtocol, PROTOCOL_VERSION_DEFAULT));
-    MSG_WriteLong(cl.servercount);
-    MSG_WriteByte(1);      // demos are always attract loops
-    MSG_WriteString(cl.gamedir);
-    MSG_WriteShort(cl.clientNum);
-    MSG_WriteString(cl.configstrings[CS_NAME]);
+    q2proto_svc_message_t message_svcdata = {.type = Q2P_SVC_SERVERDATA, .serverdata = {0}};
+    q2proto_server_fill_serverdata(&cls.demo.q2proto_context, &message_svcdata.serverdata);
+    message_svcdata.serverdata.servercount = cl.servercount;
+    message_svcdata.serverdata.attractloop = true; // demos are always attract loops
+    message_svcdata.serverdata.gamedir = q2proto_make_string(cl.gamedir);
+    message_svcdata.serverdata.clientnum = cl.clientNum;
+    message_svcdata.serverdata.levelname = q2proto_make_string(cl.configstrings[CS_NAME]);
+    message_svcdata.serverdata.q2repro.server_fps = cl.frametime_inv * 1000;
+    q2proto_server_write(&cls.demo.q2proto_context, Q2PROTO_IOARG_DEMO_WRITE, &message_svcdata);
+
+    q2proto_svc_configstring_t configstrings[MAX_CONFIGSTRINGS];
+    q2proto_svc_spawnbaseline_t spawnbaselines[MAX_PACKET_ENTITIES];
+    q2proto_gamestate_t gamestate = {.num_configstrings = 0, .configstrings = configstrings, .num_spawnbaselines = 0, .spawnbaselines = spawnbaselines};
+    memset(spawnbaselines, 0, sizeof(spawnbaselines));
 
     // configstrings
-    for (i = 0; i < cl.csr.end; i++) {
-        s = cl.configstrings[i];
-        if (!*s)
+    for (int i = 0; i < cl.csr.end; i++) {
+        char* string = cl.configstrings[i];
+        if (!string[0]) {
             continue;
-
-        len = Q_strnlen(s, MAX_QPATH);
-        if (msg_write.cursize + len + 4 > size) {
-            if (!CL_WriteDemoMessage(&msg_write))
-                return;
         }
-
-        MSG_WriteByte(svc_configstring);
-        MSG_WriteShort(i);
-        MSG_WriteData(s, len);
-        MSG_WriteByte(0);
+        q2proto_svc_configstring_t *cfgstr = &configstrings[gamestate.num_configstrings++];
+        cfgstr->index = i;
+        cfgstr->value.str = string;
+        cfgstr->value.len = Q_strnlen(string, CS_MAX_STRING_LENGTH);
     }
 
     // baselines
     for (i = 1; i < cl.csr.max_edicts; i++) {
-        ent = &cl.baselines[i];
-        if (!ent->number)
+        entity_state_t *ent = &cl.baselines[i];
+        if (!ent->number) {
             continue;
-
-        if (msg_write.cursize + MAX_PACKETENTITY_BYTES > size) {
-            if (!CL_WriteDemoMessage(&msg_write))
-                return;
         }
-
-        MSG_WriteByte(svc_spawnbaseline);
-        CL_PackEntity(&pack, ent);
-        MSG_WriteDeltaEntity(NULL, &pack, cls.demo.esFlags | MSG_ES_FORCE);
+        q2proto_svc_spawnbaseline_t *baseline = &spawnbaselines[gamestate.num_spawnbaselines++];
+        baseline->entnum = ent->number;
+        q2proto_packed_entity_state_t packed_entity;
+        PackEntity(&cls.demo.q2proto_context, ent, &packed_entity);
+        Q2PROTO_MakeEntityDelta(&cls.demo.q2proto_context, &baseline->delta_state, NULL, &packed_entity, 0);
     }
 
-    MSG_WriteByte(svc_stufftext);
-    MSG_WriteString("precache\n");
+    int write_result;
+    do {
+        write_result = q2proto_server_write_gamestate(&cls.demo.q2proto_context, NULL, Q2PROTO_IOARG_DEMO_WRITE, &gamestate);;
+        CL_WriteDemoMessage(&cls.demo.buffer);
+    } while (write_result == Q2P_ERR_NOT_ENOUGH_PACKET_SPACE);
+
+    // write fog
+    write_current_fog();
+
+    q2proto_svc_message_t message = {.type = Q2P_SVC_STUFFTEXT};
+    message.stufftext.string = q2proto_make_string("precache\n");
+    q2proto_server_write(&cls.demo.q2proto_context, Q2PROTO_IOARG_DEMO_WRITE, &message);
 
     // write it to the demo file
-    CL_WriteDemoMessage(&msg_write);
+    CL_WriteDemoMessage(&cls.demo.buffer);
 
     // the rest of the demo file will be individual frames
 }
@@ -478,28 +614,29 @@ static void resume_record(void)
     char *s;
 
     // write dirty configstrings
-    for (i = 0; i < CS_BITMAP_LONGS; i++) {
-        if (((uint32_t *)cl.dcs)[i] == 0)
+    for (i = 0; i < q_countof(cl.dcs); i++) {
+        if (cl.dcs[i] == 0)
             continue;
 
-        index = i << 5;
-        for (j = 0; j < 32; j++, index++) {
+        index = i * BC_BITS;
+        for (j = 0; j < BC_BITS; j++, index++) {
             if (!Q_IsBitSet(cl.dcs, index))
                 continue;
 
             s = cl.configstrings[index];
 
-            len = Q_strnlen(s, MAX_QPATH);
+            len = Q_strnlen(s, CS_MAX_STRING_LENGTH);
             if (cls.demo.buffer.cursize + len + 4 > cls.demo.buffer.maxsize) {
                 if (!CL_WriteDemoMessage(&cls.demo.buffer))
                     return;
                 // multiple packets = not seamless
             }
 
-            SZ_WriteByte(&cls.demo.buffer, svc_configstring);
-            SZ_WriteShort(&cls.demo.buffer, index);
-            SZ_Write(&cls.demo.buffer, s, len);
-            SZ_WriteByte(&cls.demo.buffer, 0);
+            q2proto_svc_message_t message = {.type = Q2P_SVC_CONFIGSTRING};
+            message.configstring.index = index;
+            message.configstring.value.str = s;
+            message.configstring.value.len = len;
+            q2proto_server_write(&cls.demo.q2proto_context, Q2PROTO_IOARG_DEMO_WRITE, &message);
         }
     }
 
@@ -597,15 +734,13 @@ static int read_first_message(qhandle_t f)
         return Q_ERR_INVALID_FORMAT;
     }
 
-    SZ_Init(&msg_read, msg_read_buffer, sizeof(msg_read_buffer));
-    msg_read.cursize = msglen;
-
     // read packet data
-    read = FS_Read(msg_read.data, msglen, f);
+    read = FS_Read(msg_read_buffer, msglen, f);
     if (read != msglen) {
         return read < 0 ? read : Q_ERR_UNEXPECTED_EOF;
     }
 
+    SZ_InitRead(&msg_read, msg_read_buffer, msglen);
     return type;
 }
 
@@ -630,15 +765,13 @@ static int read_next_message(qhandle_t f)
         return Q_ERR_INVALID_FORMAT;
     }
 
-    SZ_Init(&msg_read, msg_read_buffer, sizeof(msg_read_buffer));
-    msg_read.cursize = msglen;
-
     // read packet data
-    read = FS_Read(msg_read.data, msglen, f);
+    read = FS_Read(msg_read_buffer, msglen, f);
     if (read != msglen) {
         return read < 0 ? read : Q_ERR_UNEXPECTED_EOF;
     }
 
+    SZ_InitRead(&msg_read, msg_read_buffer, msglen);
     return 1;
 }
 
@@ -752,6 +885,7 @@ static void CL_PlayDemo_f(void)
     CL_Disconnect(ERR_RECONNECT);
 
     cls.demo.playback = f;
+    cls.demo.compat = !strcmp(Cmd_Argv(2), "compat");
     cls.state = ca_connected;
     Q_strlcpy(cls.servername, COM_SkipPath(name), sizeof(cls.servername));
     cls.serverAddress.type = NA_LOOPBACK;
@@ -760,11 +894,28 @@ static void CL_PlayDemo_f(void)
     Con_Popup(true);
     SCR_UpdateScreen();
 
+    q2proto_init_clientcontext(&cls.q2proto_ctx);
+
     // parse the first message just read
     CL_ParseServerMessage();
 
+    // Set up cls.demo.q2proto_context for demo snaps, with same protocol as server
+    memset(&cls.demo.server_info, 0, sizeof(cls.demo.server_info));
+    cls.demo.server_info.game_type = cls.q2proto_ctx.features.server_game_type;
+    q2proto_connect_t connect_info;
+    memset(&connect_info, 0, sizeof(connect_info));
+    connect_info.protocol = q2proto_protocol_from_netver(cls.serverProtocol);
+    connect_info.version = cls.protocolVersion;
+    connect_info.q2pro_nctype = cls.netchan.type;
+    q2proto_error_t err = q2proto_init_servercontext(&cls.demo.q2proto_context, &cls.demo.server_info, &connect_info);
+    if (err != Q2P_ERR_SUCCESS) {
+        Com_Error(ERR_DISCONNECT, "Couldn't init demo context: %d", err);
+        return;
+    }
+    SZ_InitWrite(&cls.demo.buffer, demo_buffer, MAX_MSGLEN);
+
     // read and parse messages util `precache' command
-    while (cls.state == ca_connected) {
+    for (int i = 0; cls.state == ca_connected && i < 1000; i++) {
         Cbuf_Execute(&cl_cmdbuf);
         parse_next_message(0);
     }
@@ -800,7 +951,7 @@ void CL_EmitDemoSnapshot(void)
     if (cl_demosnaps->integer <= 0)
         return;
 
-    if (cls.demo.frames_read < cls.demo.last_snapshot + cl_demosnaps->integer * 10)
+    if (cls.demo.frames_read < cls.demo.last_snapshot + cl_demosnaps->integer * BASE_FRAMERATE)
         return;
 
     if (cls.demo.numsnapshots >= MAX_SNAPSHOTS)
@@ -841,29 +992,38 @@ void CL_EmitDemoSnapshot(void)
         if (!strcmp(from, to))
             continue;
 
-        len = Q_strnlen(to, MAX_QPATH);
-        MSG_WriteByte(svc_configstring);
-        MSG_WriteShort(i);
-        MSG_WriteData(to, len);
-        MSG_WriteByte(0);
+        len = Q_strnlen(to, CS_MAX_STRING_LENGTH);
+        q2proto_svc_message_t message = {.type = Q2P_SVC_CONFIGSTRING};
+        message.configstring.index = i;
+        message.configstring.value.str = to;
+        message.configstring.value.len = len;
+        q2proto_server_write(&cls.demo.q2proto_context, Q2PROTO_IOARG_DEMO_WRITE, &message);
     }
 
     // write layout
-    MSG_WriteByte(svc_layout);
-    MSG_WriteString(cl.layout);
+    q2proto_svc_message_t message = {.type = Q2P_SVC_LAYOUT};
+    message.layout.layout_str = q2proto_make_string(cl.cgame_data.layout);
+    q2proto_server_write(&cls.demo.q2proto_context, Q2PROTO_IOARG_DEMO_WRITE, &message);
 
-    snap = Z_Malloc(sizeof(*snap) + msg_write.cursize - 1);
-    snap->framenum = cls.demo.frames_read;
-    snap->filepos = pos;
-    snap->msglen = msg_write.cursize;
-    memcpy(snap->data, msg_write.data, msg_write.cursize);
+    // write fog
+    write_current_fog();
 
-    cls.demo.snapshots = Z_Realloc(cls.demo.snapshots, sizeof(cls.demo.snapshots[0]) * ALIGN(cls.demo.numsnapshots + 1, MIN_SNAPSHOTS));
-    cls.demo.snapshots[cls.demo.numsnapshots++] = snap;
+    if (cls.demo.buffer.overflowed) {
+        Com_WPrintf("%s: message buffer overflowed\n", __func__);
+    } else {
+        snap = Z_Malloc(sizeof(*snap) + cls.demo.buffer.cursize - 1);
+        snap->framenum = cls.demo.frames_read;
+        snap->filepos = pos;
+        snap->msglen = cls.demo.buffer.cursize;
+        memcpy(snap->data, cls.demo.buffer.data, cls.demo.buffer.cursize);
 
-    Com_DPrintf("[%d] snaplen %u\n", cls.demo.frames_read, msg_write.cursize);
+        cls.demo.snapshots = Z_Realloc(cls.demo.snapshots, sizeof(cls.demo.snapshots[0]) * Q_ALIGN(cls.demo.numsnapshots + 1, MIN_SNAPSHOTS));
+        cls.demo.snapshots[cls.demo.numsnapshots++] = snap;
 
-    SZ_Clear(&msg_write);
+        Com_DPrintf("[%d] snaplen %u\n", cls.demo.frames_read, cls.demo.buffer.cursize);
+    }
+
+    SZ_Clear(&cls.demo.buffer);
 
     cls.demo.last_snapshot = cls.demo.frames_read;
 }
@@ -1060,8 +1220,7 @@ static void CL_Seek_f(void)
                 strcpy(to, from);
             }
 
-            SZ_Init(&msg_read, snap->data, snap->msglen);
-            msg_read.cursize = snap->msglen;
+            SZ_InitRead(&msg_read, snap->data, snap->msglen);
 
             CL_SeekDemoMessage();
             cls.demo.frames_read = snap->framenum;
@@ -1096,12 +1255,12 @@ static void CL_Seek_f(void)
     Com_DPrintf("[%d] after skip %d\n", cls.demo.frames_read, cl.frame.number);
 
     // update dirty configstrings
-    for (i = 0; i < CS_BITMAP_LONGS; i++) {
-        if (((uint32_t *)cl.dcs)[i] == 0)
+    for (i = 0; i < q_countof(cl.dcs); i++) {
+        if (cl.dcs[i] == 0)
             continue;
 
-        index = i << 5;
-        for (j = 0; j < 32; j++, index++) {
+        index = i * BC_BITS;
+        for (j = 0; j < BC_BITS; j++, index++) {
             if (Q_IsBitSet(cl.dcs, index))
                 CL_UpdateConfigstring(index);
         }
@@ -1134,11 +1293,9 @@ done:
     cls.demo.seeking = false;
 }
 
-static void parse_info_string(demoInfo_t *info, int clientNum, int index, const cs_remap_t *csr)
+static void parse_info_string(demoInfo_t *info, int clientNum, int index, const char* string, const cs_remap_t *csr)
 {
-    char string[MAX_QPATH], *p;
-
-    MSG_ReadString(string, sizeof(string));
+    char *p;
 
     if (index >= csr->playerskins && index < csr->playerskins + MAX_CLIENTS) {
         if (index - csr->playerskins == clientNum) {
@@ -1158,16 +1315,19 @@ static void parse_info_string(demoInfo_t *info, int clientNum, int index, const 
 CL_GetDemoInfo
 ====================
 */
-demoInfo_t *CL_GetDemoInfo(const char *path, demoInfo_t *info)
+bool CL_GetDemoInfo(const char *path, demoInfo_t *info)
 {
     qhandle_t f;
     int c, index, clientNum, type;
     const cs_remap_t *csr = &cs_remap_old;
+    bool res = false;
 
     FS_OpenFile(path, &f, FS_MODE_READ | FS_FLAG_GZIP);
     if (!f) {
-        return NULL;
+        return false;
     }
+
+    nonfatal_client_read_errors = true;
 
     type = read_first_message(f);
     if (type < 0) {
@@ -1177,50 +1337,61 @@ demoInfo_t *CL_GetDemoInfo(const char *path, demoInfo_t *info)
     info->mvd = type;
 
     if (type == 0) {
-        if (MSG_ReadByte() != svc_serverdata) {
+        q2proto_clientcontext_t demo_context;
+        q2proto_init_clientcontext(&demo_context);
+
+        q2proto_svc_message_t message;
+        if (q2proto_client_read(&demo_context, Q2PROTO_IOARG_CLIENT_READ, &message) != Q2P_ERR_SUCCESS)
+            goto fail;
+
+        if (message.type != Q2P_SVC_SERVERDATA) {
             goto fail;
         }
-        c = MSG_ReadLong();
-        if (c == PROTOCOL_VERSION_EXTENDED) {
-            csr = &cs_remap_new;
-        } else if (c < PROTOCOL_VERSION_OLD || c > PROTOCOL_VERSION_DEFAULT) {
-            goto fail;
+        switch(demo_context.features.server_game_type)
+        {
+        case Q2PROTO_GAME_VANILLA:
+            break;
+        case Q2PROTO_GAME_Q2PRO_EXTENDED:
+        case Q2PROTO_GAME_Q2PRO_EXTENDED_V2:
+            csr = &cs_remap_q2pro_new;
+            break;
+        case Q2PROTO_GAME_RERELEASE:
+            csr = &cs_remap_rerelease;
+            break;
         }
-        MSG_ReadLong();
-        MSG_ReadByte();
-        MSG_ReadString(NULL, 0);
-        clientNum = MSG_ReadShort();
-        MSG_ReadString(NULL, 0);
+        clientNum = message.serverdata.clientnum;
 
         while (1) {
-            c = MSG_ReadByte();
-            if (c == -1) {
+            q2proto_error_t err = q2proto_client_read(&demo_context, Q2PROTO_IOARG_CLIENT_READ, &message);
+            if (err == Q2P_ERR_NO_MORE_INPUT) {
                 if (read_next_message(f) <= 0) {
                     break;
                 }
                 continue; // parse new message
             }
-            if (c != svc_configstring) {
+            if (message.type != Q2P_SVC_CONFIGSTRING) {
                 break;
             }
-            index = MSG_ReadWord();
-            if (index < 0 || index >= csr->end) {
+            if (message.configstring.index < 0 || message.configstring.index >= csr->end) {
                 goto fail;
             }
-            parse_info_string(info, clientNum, index, csr);
+            parse_info_string(info, clientNum, message.configstring.index, message.configstring.value.str, csr);
         }
     } else {
         c = MSG_ReadByte();
         if ((c & SVCMD_MASK) != mvd_serverdata) {
             goto fail;
         }
-        if (MSG_ReadLong() != PROTOCOL_VERSION_MVD) {
+        int mvd_protocol = MSG_ReadLong();
+        if (mvd_protocol != PROTOCOL_VERSION_MVD) {
             goto fail;
         }
         if (c & (MVF_EXTLIMITS << SVCMD_BITS)) {
-            csr = &cs_remap_new;
+            csr = &cs_remap_q2pro_new;
         }
-        MSG_ReadWord();
+        int protocol_version = MSG_ReadWord();
+        if (protocol_version == PROTOCOL_VERSION_MVD_RERELEASE)
+            csr = &cs_remap_rerelease;
         MSG_ReadLong();
         MSG_ReadString(NULL, 0);
         clientNum = MSG_ReadShort();
@@ -1233,16 +1404,17 @@ demoInfo_t *CL_GetDemoInfo(const char *path, demoInfo_t *info)
             if (index < 0 || index >= csr->end) {
                 goto fail;
             }
-            parse_info_string(info, clientNum, index, csr);
+            char string[MAX_QPATH];
+            MSG_ReadString(string, sizeof(string));
+            parse_info_string(info, clientNum, index, string, csr);
         }
     }
-
-    FS_CloseFile(f);
-    return info;
+    res = true;
 
 fail:
     FS_CloseFile(f);
-    return NULL;
+    nonfatal_client_read_errors = false;
+    return res;
 }
 
 // =========================================================================
@@ -1267,6 +1439,10 @@ void CL_CleanupDemos(void)
                            cls.demo.time_frames, sec, fps);
             }
         }
+
+        // clear whatever stufftext remains
+        if (!cls.demo.compat)
+            Cbuf_Clear(&cl_cmdbuf);
     }
 
     CL_FreeDemoSnapshots();

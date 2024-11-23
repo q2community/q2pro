@@ -18,23 +18,27 @@ with this program; if not, write to the Free Software Foundation, Inc.,
 
 #pragma once
 
+#if USE_CLIENT
+extern const char com_env_suf[6][3];
+#endif
+
 typedef enum {
-    COLOR_BLACK,
-    COLOR_RED,
-    COLOR_GREEN,
-    COLOR_YELLOW,
-    COLOR_BLUE,
-    COLOR_CYAN,
-    COLOR_MAGENTA,
-    COLOR_WHITE,
+    COLOR_INDEX_BLACK,
+    COLOR_INDEX_RED,
+    COLOR_INDEX_GREEN,
+    COLOR_INDEX_YELLOW,
+    COLOR_INDEX_BLUE,
+    COLOR_INDEX_CYAN,
+    COLOR_INDEX_MAGENTA,
+    COLOR_INDEX_WHITE,
 
-    COLOR_ALT,
-    COLOR_NONE,
+    COLOR_INDEX_ALT,
+    COLOR_INDEX_NONE,
 
-    COLOR_COUNT
+    COLOR_INDEX_COUNT
 } color_index_t;
 
-extern const char *const colorNames[COLOR_COUNT];
+extern const char *const colorNames[COLOR_INDEX_COUNT];
 
 bool Com_WildCmpEx(const char *filter, const char *string, int term, bool ignorecase);
 #define Com_WildCmp(filter, string)  Com_WildCmpEx(filter, string, 0, false)
@@ -68,22 +72,35 @@ color_index_t Com_ParseColor(const char *s);
 unsigned Com_ParseExtensionString(const char *s, const char *const extnames[]);
 #endif
 
+extern const char com_hexchars[16];
+
+size_t Com_EscapeString(char *dst, const char *src, size_t size);
+
 char *Com_MakePrintable(const char *s);
 
+#if USE_CLIENT
+uint32_t Com_SlowRand(void);
+#define Com_SlowFrand()  ((int32_t)Com_SlowRand() * 0x1p-32f + 0.5f)
+#define Com_SlowCrand()  ((int32_t)Com_SlowRand() * 0x1p-31f)
+#endif
+
+// Bitmap chunks (for sparse bitmaps)
+#define BC_BITS         (sizeof(size_t) * CHAR_BIT)
+#define BC_COUNT(n)     (((n) + BC_BITS - 1) / BC_BITS)
+
 // Some mods actually exploit CS_STATUSBAR to take space up to CS_AIRACCEL
-static inline size_t CS_SIZE(const cs_remap_t *csr, int cs)
+static inline size_t Com_ConfigstringSize(const cs_remap_t *csr, int cs)
 {
     if (cs >= CS_STATUSBAR && cs < csr->airaccel)
-        return MAX_QPATH * (csr->airaccel - cs);
+        return CS_MAX_STRING_LENGTH * (csr->airaccel - cs);
 
     if (cs >= csr->general && cs < csr->end)
-        return MAX_QPATH * (csr->end - cs);
+        return CS_MAX_STRING_LENGTH * (csr->end - cs);
 
-    return MAX_QPATH;
+    return CS_MAX_STRING_LENGTH;
 }
 
-#if USE_FPS
-typedef struct frametime_s {
+typedef struct {
     int         time;      // variable server frame time
     int         div;       // BASE_FRAMETIME/frametime
 } frametime_t;
@@ -94,5 +111,3 @@ static inline frametime_t Com_ComputeFrametime(int rate)
     int framediv = Q_clip(rate / BASE_FRAMERATE, 1, MAX_FRAMEDIV);
     return (frametime_t){ .time = BASE_FRAMETIME / framediv, .div = framediv };
 }
-
-#endif // USE_FPS

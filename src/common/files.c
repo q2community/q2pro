@@ -24,6 +24,7 @@ with this program; if not, write to the Free Software Foundation, Inc.,
 #include "common/files.h"
 #include "common/prompt.h"
 #include "common/intreadwrite.h"
+#include "common/mapdb.h"
 #include "system/system.h"
 #include "client/client.h"
 #include "server/server.h"
@@ -34,6 +35,8 @@ with this program; if not, write to the Free Software Foundation, Inc.,
 #if USE_ZLIB
 #include <zlib.h>
 #endif
+
+#include "common/loc.h"
 
 /*
 =============================================================================
@@ -48,6 +51,28 @@ QUAKE FILESYSTEM
 
 =============================================================================
 */
+
+// built-in file table; these files are
+// baked into the executable as a "fake pak" of sorts.
+// it's always at the bottom of the path search list.
+typedef struct {
+    const char      *name;
+    const char      *data;
+    const size_t    *length_ptr;
+} builtin_file_t;
+
+#define FORWARD_EMBEDDED_FILE(n) \
+    extern const char res_##n[]; \
+    extern const size_t res_##n##_size;
+
+FORWARD_EMBEDDED_FILE(q2pro_menu);
+
+static const builtin_file_t builtin_files[] = {
+#if USE_CLIENT
+    { "q2repro.menu", res_q2pro_menu, &res_q2pro_menu_size },
+#endif
+    { NULL }
+};
 
 #define MAX_FILE_HANDLES    1024
 
@@ -79,8 +104,6 @@ QUAKE FILESYSTEM
 #define FS_ERR_READ(fp) \
     (ferror(fp) ? Q_ERR_FAILURE : Q_ERR_UNEXPECTED_EOF)
 
-#define PATH_NOT_CHECKED    -1
-
 #define FOR_EACH_SYMLINK(link, list) \
     LIST_FOR_EACH(symlink_t, link, list, entry)
 
@@ -98,6 +121,7 @@ typedef enum {
     FS_FREE,
     FS_REAL,
     FS_PAK,
+    FS_BUILTIN,
 #if USE_ZLIB
     FS_ZIP,
     FS_GZ,
@@ -127,7 +151,7 @@ typedef struct packfile_s {
 } packfile_t;
 
 typedef struct {
-    filetype_t  type;       // FS_PAK or FS_ZIP
+    filetype_t  type;       // FS_PAK, FS_ZIP or FS_BUILTIN
     unsigned    refcount;   // for tracking pack users
     FILE        *fp;
     unsigned    num_files;
@@ -155,7 +179,7 @@ typedef struct {
     packfile_t  *entry;     // pack entry this handle is tied to
     pack_t      *pack;      // points to the pack entry is from
     int         error;      // stream error indicator from read/write operation
-    int64_t     position;   // reading position for FS_PAK/FS_ZIP
+    int64_t     position;   // reading position for FS_PAK/FS_ZIP/FS_BUILTIN
     int64_t     length;     // total cached file length
 } file_t;
 
@@ -183,10 +207,10 @@ static int          fs_num_files;
 static bool         fs_non_uniq_open;
 
 #if USE_DEBUG
-static int          fs_count_read;
-static int          fs_count_open;
-static int          fs_count_strcmp;
-static int          fs_count_strlwr;
+static unsigned     fs_count_read;
+static unsigned     fs_count_open;
+static unsigned     fs_count_strcmp;
+static unsigned     fs_count_strlwr;
 #define FS_COUNT_READ       fs_count_read++
 #define FS_COUNT_OPEN       fs_count_open++
 #define FS_COUNT_STRCMP     fs_count_strcmp++
@@ -271,9 +295,9 @@ FS_ValidatePath
 Checks for bad (OS specific) and mixed case characters in path.
 ================
 */
-int FS_ValidatePath(const char *s)
+path_valid_t FS_ValidatePath(const char *s)
 {
-    int res = PATH_VALID;
+    path_valid_t res = PATH_VALID;
 
     if (!*s)
         return PATH_INVALID;
@@ -302,12 +326,13 @@ void FS_CleanupPath(char *s)
 FS_NormalizePathBuffer
 
 Simplifies the path, converting backslashes to slashes and removing ./ and ../
-components, as well as duplicated slashes. Any leading slashes are also skipped.
-Return value == size signifies overflow.
+components, as well as duplicated slashes. Any leading/trailing slashes are
+also stripped. Return value == size signifies overflow.
 
 May operate in place if in == out.
 
     ///foo       -> foo
+    foo/         -> foo
     foo\bar      -> foo/bar
     foo/..       -> <empty>
     foo/../bar   -> bar
@@ -341,7 +366,7 @@ size_t FS_NormalizePathBuffer(char *out, const char *in, size_t size)
                     if (c == 0)
                         break;
                     if (out > start)
-                        // save the slash
+                        // keep the slash
                         out++;
                 }
                 pre = '/';
@@ -362,8 +387,12 @@ size_t FS_NormalizePathBuffer(char *out, const char *in, size_t size)
             }
 
             if ((pre & 0xff) == '/') {
-                if (c == 0)
+                if (c == 0) {
+                    if (out > start)
+                        // eat the slash
+                        out--;
                     break;
+                }
                 continue;
             }
 
@@ -421,7 +450,7 @@ static file_t *file_for_handle(qhandle_t f)
 }
 
 // expects a buffer of at least MAX_OSPATH bytes!
-static symlink_t *expand_links(list_t *list, char *buffer, size_t *len_p)
+static symlink_t *expand_links(const list_t *list, char *buffer, size_t *len_p)
 {
     symlink_t   *link;
     size_t      namelen = *len_p;
@@ -486,6 +515,7 @@ int64_t FS_Tell(qhandle_t f)
         }
         return ret;
     case FS_PAK:
+    case FS_BUILTIN:
         return file->position;
 #if USE_ZLIB
     case FS_ZIP:
@@ -503,7 +533,7 @@ int64_t FS_Tell(qhandle_t f)
     }
 }
 
-static int64_t get_seek_offset(file_t *file, int64_t offset, int whence)
+static int64_t get_seek_offset(const file_t *file, int64_t offset, int whence)
 {
     switch (whence) {
     case SEEK_SET:
@@ -539,6 +569,17 @@ static int seek_pak_file(file_t *file, int64_t offset, int whence)
     return Q_ERR_SUCCESS;
 }
 
+static int seek_builtin_file(file_t *file, int64_t offset, int whence)
+{
+    offset = get_seek_offset(file, offset, whence);
+    if (offset < 0)
+        return offset;
+
+    file->position = offset;
+    return Q_ERR_SUCCESS;
+}
+
+
 /*
 ============
 FS_Seek
@@ -561,6 +602,8 @@ int FS_Seek(qhandle_t f, int64_t offset, int whence)
         return Q_ERR_SUCCESS;
     case FS_PAK:
         return seek_pak_file(file, offset, whence);
+    case FS_BUILTIN:
+        return seek_builtin_file(file, offset, whence);
 #if USE_ZLIB
     case FS_ZIP:
         return seek_zip_file(file, offset, whence);
@@ -605,6 +648,11 @@ int FS_CreatePath(char *path)
         }
     } else if (Q_isalpha(*path) && path[1] == ':') {
         ofs = path + 2; // skip drive part
+    }
+    
+    // check for drive path and skip N: part
+    if (Q_isalpha(*path) && path[1] == ':') {
+        ofs = path + 2;
     }
 #endif
 
@@ -655,6 +703,8 @@ int FS_CloseFile(qhandle_t f)
         } else {
             fs_non_uniq_open = false;
         }
+        break;
+    case FS_BUILTIN:
         break;
 #if USE_ZLIB
     case FS_GZ:
@@ -1025,6 +1075,8 @@ static int read_zip_file(file_t *file, void *buf, size_t len)
     size_t block, result;
     int ret;
 
+    Q_assert(file->position <= file->length);
+
     len = min(len, file->length - file->position);
     if (!len) {
         return 0;
@@ -1122,22 +1174,24 @@ static int seek_zip_file(file_t *file, int64_t offset, int whence)
 // open a new file on the pakfile
 static int64_t open_from_pack(file_t *file, pack_t *pack, packfile_t *entry)
 {
-    FILE *fp;
+    FILE *fp = NULL;
     int ret;
 
-    if (IS_UNIQUE(file)) {
-        fp = fopen(pack->filename, "rb");
-        if (!fp) {
-            ret = Q_ERRNO;
-            goto fail1;
+    if (pack->type != FS_BUILTIN) {
+        if (IS_UNIQUE(file)) {
+            fp = fopen(pack->filename, "rb");
+            if (!fp) {
+                ret = Q_ERRNO;
+                goto fail1;
+            }
+        } else {
+            if (fs_non_uniq_open) {
+                ret = Q_ERR(EBUSY);
+                goto fail1;
+            }
+            fp = pack->fp;
+            clearerr(fp);
         }
-    } else {
-        if (fs_non_uniq_open) {
-            ret = Q_ERR(EBUSY);
-            goto fail1;
-        }
-        fp = pack->fp;
-        clearerr(fp);
     }
 
 #if USE_ZLIB
@@ -1154,9 +1208,11 @@ static int64_t open_from_pack(file_t *file, pack_t *pack, packfile_t *entry)
         goto fail2;
     }
 
-    if (os_fseek(fp, entry->filepos, SEEK_SET)) {
-        ret = Q_ERRNO;
-        goto fail2;
+    if (pack->type != FS_BUILTIN) {
+        if (os_fseek(fp, entry->filepos, SEEK_SET)) {
+            ret = Q_ERRNO;
+            goto fail2;
+        }
     }
 
     file->type = pack->type;
@@ -1185,7 +1241,7 @@ static int64_t open_from_pack(file_t *file, pack_t *pack, packfile_t *entry)
     if (IS_UNIQUE(file)) {
         // reference source pak
         pack_get(pack);
-    } else {
+    } else if (pack->type != FS_BUILTIN) {
         fs_non_uniq_open = true;
     }
 
@@ -1315,7 +1371,7 @@ static int64_t open_file_read(file_t *file, const char *normalized, size_t namel
     unsigned        hash;
     packfile_t      *entry;
     int64_t         ret;
-    int             valid;
+    path_valid_t    valid;
 
     FS_COUNT_READ;
 
@@ -1328,10 +1384,9 @@ static int64_t open_file_read(file_t *file, const char *normalized, size_t namel
 
 // search through the path, one element at a time
     for (search = fs_searchpaths; search; search = search->next) {
-        if (file->mode & FS_PATH_MASK) {
-            if ((file->mode & search->mode & FS_PATH_MASK) == 0) {
-                continue;
-            }
+        if ((file->mode & search->mode & FS_PATH_MASK) == 0 ||
+            (file->mode & search->mode & FS_DIR_MASK ) == 0) {
+            continue;
         }
 
         // is the element a pak file?
@@ -1437,6 +1492,8 @@ static int read_pak_file(file_t *file, void *buf, size_t len)
 {
     size_t result;
 
+    Q_assert(file->position <= file->length);
+
     len = min(len, file->length - file->position);
     if (!len) {
         return 0;
@@ -1452,6 +1509,22 @@ static int read_pak_file(file_t *file, void *buf, size_t len)
 
     file->position += result;
     return result;
+}
+
+static int read_builtin_file(file_t *file, void *buf, size_t len)
+{
+    Q_assert(file->position <= file->length);
+
+    len = min(len, file->length - file->position);
+    if (!len) {
+        return 0;
+    }
+
+    memcpy(buf, (const void *) (intptr_t) (file->entry->filepos + file->position), len);
+
+    file->position += len;
+
+    return len;
 }
 
 static int read_phys_file(file_t *file, void *buf, size_t len)
@@ -1502,6 +1575,8 @@ int FS_Read(void *buf, size_t len, qhandle_t f)
         return read_phys_file(file, buf, len);
     case FS_PAK:
         return read_pak_file(file, buf, len);
+    case FS_BUILTIN:
+        return read_builtin_file(file, buf, len);
 #if USE_ZLIB
     case FS_GZ:
         ret = gzread(file->zfp, buf, len);
@@ -1630,6 +1705,17 @@ int FS_Write(const void *buf, size_t len, qhandle_t f)
     return len;
 }
 
+static unsigned default_lookup_flags(unsigned flags)
+{
+    if (!(flags & FS_PATH_MASK) || !fs_game->string[0])
+        flags |= FS_PATH_MASK;
+
+    if (!(flags & FS_DIR_MASK) || !sys_homedir->string[0])
+        flags |= FS_DIR_MASK;
+
+    return flags;
+}
+
 /*
 ============
 FS_OpenFile
@@ -1656,7 +1742,7 @@ int64_t FS_OpenFile(const char *name, qhandle_t *f, unsigned mode)
         return Q_ERR(EMFILE);
     }
 
-    file->mode = mode;
+    file->mode = default_lookup_flags(mode);
 
     if ((mode & FS_MODE_MASK) == FS_MODE_READ) {
         ret = expand_open_file_read(file, name);
@@ -1834,13 +1920,17 @@ int FS_LoadFileEx(const char *path, void **buffer, unsigned flags, memtag_t tag)
         return Q_ERR(EAGAIN); // not yet initialized
     }
 
+    if (flags & FS_MODE_MASK) {
+        return Q_ERR(EINVAL);
+    }
+
     // allocate new file handle
     file = alloc_handle(&f);
     if (!file) {
         return Q_ERR(EMFILE);
     }
 
-    file->mode = (flags & ~FS_MODE_MASK) | FS_MODE_READ | FS_FLAG_LOADFILE;
+    file->mode = default_lookup_flags(flags) | FS_MODE_READ | FS_FLAG_LOADFILE;
 
     // look for it in the filesystem or pack files
     len = expand_open_file_read(file, path);
@@ -2003,7 +2093,8 @@ int FS_FPrintf(qhandle_t f, const char *format, ...)
 
 static void pack_free(pack_t *pack)
 {
-    fclose(pack->fp);
+    if (pack->fp)
+        fclose(pack->fp);
     Z_Free(pack->names);
     Z_Free(pack->file_hash);
     Z_Free(pack->files);
@@ -2035,8 +2126,10 @@ static pack_t *pack_alloc(FILE *fp, filetype_t type, const char *name,
                           unsigned num_files, size_t names_len)
 {
     pack_t *pack;
+    size_t len;
 
-    pack = FS_Malloc(sizeof(*pack) + strlen(name));
+    len = strlen(name);
+    pack = FS_Malloc(sizeof(*pack) + len);
     pack->type = type;
     pack->refcount = 0;
     pack->fp = fp;
@@ -2045,7 +2138,7 @@ static pack_t *pack_alloc(FILE *fp, filetype_t type, const char *name,
     pack->hash_size = 0;
     pack->file_hash = NULL;
     pack->names = FS_Malloc(names_len);
-    strcpy(pack->filename, name);
+    memcpy(pack->filename, name, len + 1);
 
     return pack;
 }
@@ -2060,7 +2153,13 @@ static void pack_calc_hashes(pack_t *pack)
     pack->file_hash = FS_Mallocz(pack->hash_size * sizeof(pack->file_hash[0]));
 
     for (i = 0, file = pack->files; i < pack->num_files; i++, file++) {
-        unsigned hash = FS_HashPath(pack->names + file->nameofs, pack->hash_size);
+        char *name = pack->names + file->nameofs;
+        unsigned hash;
+
+        // force conversion to lower case. mixed case paths are annoying.
+        Q_strlwr(name);
+
+        hash = Com_HashString(name, pack->hash_size);
         file->hash_next = pack->file_hash[hash];
         pack->file_hash[hash] = file;
     }
@@ -2087,43 +2186,43 @@ static pack_t *load_pak_file(const char *packfile)
     }
 
     if (!fread(&header, sizeof(header), 1, fp)) {
-        Com_SetLastError("reading header failed");
+        Com_SetLastError("Reading header failed");
         goto fail1;
     }
 
     if (LittleLong(header.ident) != IDPAKHEADER) {
-        Com_SetLastError("bad header ident");
+        Com_SetLastError("Bad header ident");
         goto fail1;
     }
 
     header.dirlen = LittleLong(header.dirlen);
     if (header.dirlen % sizeof(dpackfile_t)) {
-        Com_SetLastError("bad directory length");
+        Com_SetLastError("Bad directory length");
         goto fail1;
     }
 
     num_files = header.dirlen / sizeof(dpackfile_t);
     if (num_files < 1) {
-        Com_SetLastError("no files");
+        Com_SetLastError("No files");
         goto fail1;
     }
     if (num_files > MAX_FILES_IN_PACK) {
-        Com_SetLastError("too many files");
+        Com_SetLastError("Too many files");
         goto fail1;
     }
 
     header.dirofs = LittleLong(header.dirofs);
-    if (header.dirofs > INT_MAX) {
-        Com_SetLastError("bad directory offset");
+    if (header.dirofs > INT32_MAX) {
+        Com_SetLastError("Bad directory offset");
         goto fail1;
     }
     if (os_fseek(fp, header.dirofs, SEEK_SET)) {
-        Com_SetLastError("seeking to directory failed");
+        Com_SetLastError("Seeking to directory failed");
         goto fail1;
     }
     info = FS_AllocTempMem(header.dirlen);
     if (!fread(info, header.dirlen, 1, fp)) {
-        Com_SetLastError("reading directory failed");
+        Com_SetLastError("Reading directory failed");
         goto fail2;
     }
 
@@ -2131,8 +2230,8 @@ static pack_t *load_pak_file(const char *packfile)
     for (i = 0, dfile = info; i < num_files; i++, dfile++) {
         dfile->filepos = LittleLong(dfile->filepos);
         dfile->filelen = LittleLong(dfile->filelen);
-        if (dfile->filelen > INT_MAX || dfile->filepos > INT_MAX - dfile->filelen) {
-            Com_SetLastError("file length or position too big");
+        if (dfile->filelen > INT32_MAX || dfile->filepos > INT32_MAX - dfile->filelen) {
+            Com_SetLastError("File length or position too big");
             goto fail2;
         }
         names_len += Q_strnlen(dfile->name, sizeof(dfile->name)) + 1;
@@ -2175,6 +2274,68 @@ fail2:
     FS_FreeTempMem(info);
 fail1:
     fclose(fp);
+    return NULL;
+}
+
+// Loads the built-in "pak".
+static pack_t *load_builtin_file(void)
+{
+    packfile_t      *file;
+    unsigned        i, num_files;
+    char            *name;
+    size_t          len, names_len;
+    pack_t          *pack;
+
+    num_files = q_countof(builtin_files) - 1;
+    if (num_files < 1) {
+        Com_SetLastError("No files");
+        goto fail1;
+    }
+    if (num_files > MAX_FILES_IN_PACK) {
+        Com_SetLastError("Too many files");
+        goto fail1;
+    }
+
+    const builtin_file_t *dfile;
+
+    names_len = 0;
+    for (i = 0, dfile = builtin_files; i < num_files; i++, dfile++) {
+        names_len += strlen(dfile->name) + 1;
+    }
+
+// allocate the pack
+    pack = pack_alloc(NULL, FS_BUILTIN, "builtin", num_files, names_len);
+
+// parse the directory
+    file = pack->files;
+    name = pack->names;
+    for (i = 0, dfile = builtin_files; i < num_files; i++, dfile++) {
+        len = strlen(dfile->name);
+        memcpy(name, dfile->name, len);
+        name[len] = 0;
+
+        file->namelen = FS_NormalizePath(name);
+        file->nameofs = name - pack->names;
+        name += file->namelen + 1;
+
+        file->filepos = (int64_t) (ptrdiff_t) dfile->data;
+        file->filelen = *dfile->length_ptr;
+#if USE_ZLIB
+        file->complen = file->filelen;
+        file->compmtd = 0;
+        file->coherent = true;
+#endif
+        file++;
+    }
+
+    pack_calc_hashes(pack);
+
+    FS_DPrintf("%s: %u files, %u hash\n",
+               "builtin", pack->num_files, pack->hash_size);
+
+    return pack;
+
+fail1:
     return NULL;
 }
 
@@ -2267,7 +2428,7 @@ static bool parse_zip64_extra_data(packfile_t *file, const byte *buf, int size)
     return true;
 }
 
-static bool parse_extra_data(pack_t *pack, packfile_t *file, int xtra_size)
+static bool parse_extra_data(const pack_t *pack, packfile_t *file, int xtra_size)
 {
     byte buf[0xffff];
     int pos = 0;
@@ -2288,7 +2449,7 @@ static bool parse_extra_data(pack_t *pack, packfile_t *file, int xtra_size)
     return false;
 }
 
-static bool get_file_info(pack_t *pack, packfile_t *file, char *name, size_t *len, bool zip64)
+static bool get_file_info(const pack_t *pack, packfile_t *file, char *name, size_t *len, bool zip64)
 {
     unsigned comp_mtd, comp_len, file_len, name_size, xtra_size, comm_size, file_pos;
     byte header[ZIP_SIZECENTRALDIRITEM]; // we can't use a struct here because of packing
@@ -2296,13 +2457,13 @@ static bool get_file_info(pack_t *pack, packfile_t *file, char *name, size_t *le
     *len = 0;
 
     if (!fread(header, sizeof(header), 1, pack->fp)) {
-        Com_SetLastError("reading central directory failed");
+        Com_SetLastError("Reading central directory failed");
         return false;
     }
 
     // check the magic
     if (RL32(&header[0]) != ZIP_CENTRALHEADERMAGIC) {
-        Com_SetLastError("bad central directory magic");
+        Com_SetLastError("Bad central directory magic");
         return false;
     }
 
@@ -2324,7 +2485,7 @@ static bool get_file_info(pack_t *pack, packfile_t *file, char *name, size_t *le
     file->filelen = file_len;
     file->filepos = file_pos;
     if (!fread(name, name_size, 1, pack->fp)) {
-        Com_SetLastError("reading central directory failed");
+        Com_SetLastError("Reading central directory failed");
         return false;
     }
     name[name_size] = 0;
@@ -2332,11 +2493,11 @@ static bool get_file_info(pack_t *pack, packfile_t *file, char *name, size_t *le
 
     if (file_pos == UINT32_MAX || file_len == UINT32_MAX || comp_len == UINT32_MAX) {
         if (!zip64) {
-            Com_SetLastError("file length or position too big");
+            Com_SetLastError("File length or position too big");
             return false;
         }
         if (!parse_extra_data(pack, file, xtra_size)) {
-            Com_SetLastError("parsing zip64 extra data failed");
+            Com_SetLastError("Parsing zip64 extra data failed");
             return false;
         }
         xtra_size = 0;
@@ -2347,7 +2508,7 @@ static bool get_file_info(pack_t *pack, packfile_t *file, char *name, size_t *le
 
 skip:
     if (os_fseek(pack->fp, name_size + xtra_size + comm_size, SEEK_CUR)) {
-        Com_SetLastError("seeking to central directory failed");
+        Com_SetLastError("Seeking to central directory failed");
         return false;
     }
 
@@ -2375,7 +2536,7 @@ static pack_t *load_zip_file(const char *packfile)
 
     header_pos = search_central_header(fp);
     if (!header_pos) {
-        Com_SetLastError("no central header found");
+        Com_SetLastError("No central header found");
         goto fail2;
     }
 
@@ -2388,11 +2549,11 @@ static pack_t *load_zip_file(const char *packfile)
     }
 
     if (os_fseek(fp, header_pos, SEEK_SET)) {
-        Com_SetLastError("seeking to central header failed");
+        Com_SetLastError("Seeking to central header failed");
         goto fail2;
     }
     if (!fread(header, header_size, 1, fp)) {
-        Com_SetLastError("reading central header failed");
+        Com_SetLastError("Reading central header failed");
         goto fail2;
     }
 
@@ -2413,21 +2574,21 @@ static pack_t *load_zip_file(const char *packfile)
     }
 
     if (num_files_cd != num_files || num_disk_cd != 0 || num_disk != 0) {
-        Com_SetLastError("unsupported multi-part archive");
+        Com_SetLastError("Unsupported multi-part archive");
         goto fail2;
     }
     if (num_files_cd < 1) {
-        Com_SetLastError("no files");
+        Com_SetLastError("No files");
         goto fail2;
     }
     if (num_files_cd > ZIP_MAXFILES) {
-        Com_SetLastError("too many files");
+        Com_SetLastError("Too many files");
         goto fail2;
     }
 
     central_end = central_ofs + central_size;
     if (central_end > header_pos || central_end < central_ofs) {
-        Com_SetLastError("bad central directory offset");
+        Com_SetLastError("Bad central directory offset");
         goto fail2;
     }
 
@@ -2438,7 +2599,7 @@ static pack_t *load_zip_file(const char *packfile)
     }
 
     if (os_fseek(fp, central_ofs + extra_bytes, SEEK_SET)) {
-        Com_SetLastError("seeking to central directory failed");
+        Com_SetLastError("Seeking to central directory failed");
         goto fail2;
     }
 
@@ -2455,7 +2616,7 @@ static pack_t *load_zip_file(const char *packfile)
         if (len) {
             // fix absolute position
             if (file->filepos > INT64_MAX - extra_bytes) {
-                Com_SetLastError("bad file position");
+                Com_SetLastError("Bad file position");
                 goto fail1;
             }
             file->filepos += extra_bytes;
@@ -2472,7 +2633,7 @@ static pack_t *load_zip_file(const char *packfile)
     names_len = name - pack->names;
 
     if (!num_files) {
-        Com_SetLastError("no valid files");
+        Com_SetLastError("No valid files");
         goto fail1;
     }
 
@@ -2732,13 +2893,17 @@ void **FS_ListFiles(const char *path, const char *filter, unsigned flags, int *c
     listfiles_t     list;
     size_t          len, pathlen;
     char            *s, *p;
-    int             valid;
+    path_valid_t    valid;
 
     memset(&list, 0, sizeof(list));
     valid = PATH_NOT_CHECKED;
 
     if (count_p) {
         *count_p = 0;
+    }
+
+    if (!fs_searchpaths) {
+        return NULL; // not yet initialized
     }
 
     if (!path) {
@@ -2759,11 +2924,12 @@ void **FS_ListFiles(const char *path, const char *filter, unsigned flags, int *c
         return NULL;
     }
 
+    flags = default_lookup_flags(flags);
+
     for (search = fs_searchpaths; search; search = search->next) {
-        if (flags & FS_PATH_MASK) {
-            if ((flags & search->mode & FS_PATH_MASK) == 0) {
-                continue;
-            }
+        if ((flags & search->mode & FS_PATH_MASK) == 0 ||
+            (flags & search->mode & FS_DIR_MASK ) == 0) {
+            continue;
         }
         if (search->pack) {
             if ((flags & FS_TYPE_MASK) == FS_TYPE_REAL) {
@@ -2967,7 +3133,7 @@ void FS_File_g(const char *path, const char *ext, unsigned flags, genctx_t *ctx)
     for (i = 0; i < numFiles; i++) {
         s = list[i];
         if (ctx->count < ctx->size && !strncmp(s, ctx->partial, ctx->length)) {
-            ctx->matches = Z_Realloc(ctx->matches, ALIGN(ctx->count + 1, MIN_MATCHES) * sizeof(char *));
+            ctx->matches = Z_Realloc(ctx->matches, Q_ALIGN(ctx->count + 1, MIN_MATCHES) * sizeof(char *));
             ctx->matches[ctx->count++] = s;
         } else {
             Z_Free(s);
@@ -3045,7 +3211,8 @@ static void FS_WhereIs_f(void)
     symlink_t       *link;
     unsigned        hash;
     file_info_t     info;
-    int             ret, total, valid;
+    int             ret, total;
+    path_valid_t    valid;
     size_t          len, namelen;
     bool            report_all;
 
@@ -3218,6 +3385,7 @@ static void FS_Path_f(void)
                 numFilesInZIP += s->pack->num_files;
             else
 #endif
+            if (s->pack->type == FS_PAK)
                 numFilesInPAK += s->pack->num_files;
             Com_Printf("%s (%i files)\n", s->pack->filename, s->pack->num_files);
         } else {
@@ -3276,10 +3444,10 @@ static void FS_Stats_f(void)
     }
 
     Com_Printf("File slots allocated: %d\n", fs_num_files);
-    Com_Printf("Total calls to open_file_read: %d\n", fs_count_read);
-    Com_Printf("Total path comparsions: %d\n", fs_count_strcmp);
-    Com_Printf("Total calls to open_from_disk: %d\n", fs_count_open);
-    Com_Printf("Total mixed-case reopens: %d\n", fs_count_strlwr);
+    Com_Printf("Total calls to open_file_read: %u\n", fs_count_read);
+    Com_Printf("Total path comparsions: %u\n", fs_count_strcmp);
+    Com_Printf("Total calls to open_from_disk: %u\n", fs_count_open);
+    Com_Printf("Total mixed-case reopens: %u\n", fs_count_strlwr);
 
     if (!totalHashSize) {
         Com_Printf("No stats to display\n");
@@ -3477,6 +3645,23 @@ static void free_game_paths(void)
     fs_searchpaths = fs_base_searchpaths;
 }
 
+// add builtin stuff
+static void add_builtin_content(void)
+{
+#if USE_ZLIB
+    pack_t *pack;
+    searchpath_t *search;
+
+    pack = load_builtin_file();
+    search = FS_Malloc(sizeof(*search));
+    search->mode = FS_PATH_BASE | FS_DIR_BASE;
+    search->filename[0] = 0;
+    search->pack = pack_get(pack);
+    search->next = fs_searchpaths;
+    fs_searchpaths = search;
+#endif
+}
+
 // game needs this for localized map messages
 static void add_game_kpf(const char *dir)
 {
@@ -3493,7 +3678,7 @@ static void add_game_kpf(const char *dir)
         return;
 
     search = FS_Malloc(sizeof(*search));
-    search->mode = FS_PATH_BASE | FS_PATH_GAME;
+    search->mode = FS_PATH_BASE | FS_DIR_BASE;
     search->filename[0] = 0;
     search->pack = pack_get(pack);
     search->next = fs_searchpaths;
@@ -3503,14 +3688,12 @@ static void add_game_kpf(const char *dir)
 
 static void setup_base_paths(void)
 {
-    // base paths have both BASE and GAME bits set by default
-    // the GAME bit will be removed once gamedir is set,
-    // and will be put back once gamedir is reset to basegame
+    add_builtin_content();
     add_game_kpf(sys_basedir->string);
-    add_game_dir(FS_PATH_BASE | FS_PATH_GAME, "%s/"BASEGAME, sys_basedir->string);
+    add_game_dir(FS_PATH_BASE | FS_DIR_BASE, "%s/"BASEGAME, sys_basedir->string);
 
     if (sys_homedir->string[0]) {
-        add_game_dir(FS_PATH_BASE | FS_PATH_GAME, "%s/"BASEGAME, sys_homedir->string);
+        add_game_dir(FS_PATH_BASE | FS_DIR_HOME, "%s/"BASEGAME, sys_homedir->string);
     }
 
     fs_base_searchpaths = fs_searchpaths;
@@ -3519,32 +3702,18 @@ static void setup_base_paths(void)
 // Sets the gamedir and path to a different directory.
 static void setup_game_paths(void)
 {
-    searchpath_t *path;
-
     if (fs_game->string[0]) {
         // add system path first
-        add_game_dir(FS_PATH_GAME, "%s/%s", sys_basedir->string, fs_game->string);
+        add_game_dir(FS_PATH_GAME | FS_DIR_BASE, "%s/%s", sys_basedir->string, fs_game->string);
 
         // home paths override system paths
         if (sys_homedir->string[0]) {
-            add_game_dir(FS_PATH_GAME, "%s/%s", sys_homedir->string, fs_game->string);
+            add_game_dir(FS_PATH_GAME | FS_DIR_HOME, "%s/%s", sys_homedir->string, fs_game->string);
         }
-
-        // remove the game bit from base paths
-        for (path = fs_base_searchpaths; path; path = path->next) {
-            path->mode &= ~FS_PATH_GAME;
-        }
-
-        // this var is set for compatibility with server browsers, etc
-        Cvar_FullSet("gamedir", fs_game->string, CVAR_ROM | CVAR_SERVERINFO, FROM_CODE);
-    } else {
-        // add the game bit to base paths
-        for (path = fs_base_searchpaths; path; path = path->next) {
-            path->mode |= FS_PATH_GAME;
-        }
-
-        Cvar_FullSet("gamedir", "", CVAR_ROM, FROM_CODE);
     }
+
+    // this var is set for compatibility with server browsers, etc
+    Cvar_FullSet("gamedir", fs_game->string, CVAR_ROM | CVAR_SERVERINFO, FROM_CODE);
 
     // this var is used by the game library to find it's home directory
     Cvar_FullSet("fs_gamedir", fs_gamedir, CVAR_ROM, FROM_CODE);
@@ -3583,9 +3752,13 @@ void FS_Restart(bool total)
         setup_base_gamedir();
     }
 
+    MapDB_Shutdown();
+
     setup_game_paths();
 
     SV_RestartFilesystem();
+
+    MapDB_Init();
 
     FS_Path_f();
 
@@ -3712,6 +3885,8 @@ static void fs_game_changed(cvar_t *self)
         // check for game override
         setup_game_paths();
 
+        MapDB_Init();
+
         FS_Path_f();
         return;
     }
@@ -3756,6 +3931,85 @@ static void fs_game_generator(genctx_t *ctx)
         list_dirs(ctx, sys_homedir->string);
 }
 
+// TODO: find a better home (lol) for me
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#endif
+
+/*
+================
+FS_FindBaseDir
+================
+*/
+static void FS_FindBaseDir(void)
+{
+    // TODO: figure out something here. DEFGAME macro
+    // is empty by default which we should fix.
+    //static const char *defgame = "baseq2";
+
+    // Don't try to detect the base directory if it was already explicitly specified
+    bool detect_base_dir = !strcmp(sys_basedir->string, sys_basedir->default_string) &&
+                           !strcmp(sys_libdir->string, sys_libdir->default_string);
+
+    if (detect_base_dir) {
+        // find Steam installation dir first
+        char client_dir[MAX_OSPATH] = { 0 };
+
+        if (Sys_GetInstalledGamePath(GAME_PATH_STEAM, client_dir, sizeof(client_dir))) {
+
+            // found Steam dir - see if the mode we want is available
+            listfiles_t list = {
+                .flags = FS_SEARCH_DIRSONLY,
+                .baselen = strlen(client_dir) + 1,
+            };
+
+            Sys_ListFiles_r(&list, client_dir, 0);
+
+            bool has_rerelease = false;
+
+            for (int i = 0; i < list.count; i++) {
+                char *s = list.files[i];
+
+                if (!Q_stricmp(s, "rerelease")) {
+                    has_rerelease = true;
+                }
+
+                Z_Free(s);
+            }
+
+            Z_Free(list.files);
+
+            if (com_rerelease->integer == RERELEASE_MODE_YES && has_rerelease) {
+                Q_strlcat(client_dir, PATH_SEP_STRING "rerelease", sizeof(client_dir));
+            }
+        } else if (com_rerelease->integer == RERELEASE_MODE_YES && Sys_GetInstalledGamePath(GAME_PATH_GOG_RERELEASE, client_dir, sizeof(client_dir))) {
+            //
+        } else if (com_rerelease->integer == RERELEASE_MODE_YES && Sys_GetInstalledGamePath(GAME_PATH_XBOX_RERELEASE, client_dir, sizeof(client_dir))) {
+            //
+        } else if (com_rerelease->integer == RERELEASE_MODE_NO && Sys_GetInstalledGamePath(GAME_PATH_GOG_CLASSIC, client_dir, sizeof(client_dir))) {
+            //
+        }
+
+        // Don't set an "empty" base dir, use defaults instead
+        if (*client_dir) {
+            Cvar_Set("basedir", client_dir);
+            Cvar_Set("libdir", client_dir);
+        }
+    }
+
+    // TODO: find a better home (lol) for me
+#ifdef _WIN32
+    if (com_rerelease->integer == RERELEASE_MODE_YES) {
+        char homedir[MAX_OSPATH];
+        if (ExpandEnvironmentStringsA("%userprofile%\\Saved Games\\NightDive Studios\\Quake II", homedir, sizeof(homedir) - 2)) {
+            FS_NormalizePath(homedir);
+            Cvar_Set("homedir", homedir);
+        }
+    }
+#endif
+}
+
 /*
 ================
 FS_Init
@@ -3783,9 +4037,16 @@ void FS_Init(void)
 
     // get the game cvar and start the filesystem
     fs_game = Cvar_Get("game", DEFGAME, CVAR_LATCH | CVAR_SERVERINFO | CVAR_NOARCHIVE);
+
+    if (com_rerelease->integer != RERELEASE_MODE_NEVER) {
+        FS_FindBaseDir();
+    }
+
     fs_game->changed = fs_game_changed;
     fs_game->generator = fs_game_generator;
     fs_game_changed(fs_game);
 
     Com_Printf("-----------------------\n");
+
+    Loc_Init();
 }

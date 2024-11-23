@@ -18,17 +18,12 @@ with this program; if not, write to the Free Software Foundation, Inc.,
 
 #pragma once
 
-#define AL_NO_PROTOTYPES
+#define AL_ALEXT_PROTOTYPES
 
-#ifdef __APPLE__
-#include <OpenAL/al.h>
-#include <OpenAL/alext.h>
-#include <OpenAL/efx.h>
-#else
 #include <AL/al.h>
 #include <AL/alext.h>
 #include <AL/efx.h>
-#endif
+#include <AL/efx-presets.h>
 
 #ifndef QALAPI
 #define QALAPI extern
@@ -65,12 +60,22 @@ QALAPI LPALSOURCESTOP qalSourceStop;
 QALAPI LPALSOURCEUNQUEUEBUFFERS qalSourceUnqueueBuffers;
 QALAPI LPALSOURCEF qalSourcef;
 QALAPI LPALSOURCEI qalSourcei;
+QALAPI LPALSOURCE3I qalSource3i;
 
 // ALC_EXT_EFX
 QALAPI LPALDELETEFILTERS qalDeleteFilters;
 QALAPI LPALFILTERF qalFilterf;
 QALAPI LPALFILTERI qalFilteri;
 QALAPI LPALGENFILTERS qalGenFilters;
+QALAPI LPALGENEFFECTS qalGenEffects;
+QALAPI LPALDELETEEFFECTS qalDeleteEffects;
+QALAPI LPALEFFECTI qalEffecti;
+QALAPI LPALEFFECTIV qalEffectiv;
+QALAPI LPALEFFECTF qalEffectf;
+QALAPI LPALEFFECTFV qalEffectfv;
+QALAPI LPALGENAUXILIARYEFFECTSLOTS qalGenAuxiliaryEffectSlots;
+QALAPI LPALDELETEAUXILIARYEFFECTSLOTS qalDeleteAuxiliaryEffectSlots;
+QALAPI LPALAUXILIARYEFFECTSLOTI qalAuxiliaryEffectSloti;
 
 bool QAL_Init(void);
 void QAL_Shutdown(void);

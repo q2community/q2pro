@@ -18,8 +18,11 @@ with this program; if not, write to the Free Software Foundation, Inc.,
 
 #include "server.h"
 #include "client/input.h"
-
-pmoveParams_t   sv_pmp;
+#if USE_CLIENT
+#include "refresh/refresh.h"
+#endif
+#include "server/nav.h"
+#include "q2proto/q2proto.h"
 
 master_t    sv_masters[MAX_MASTERS];   // address of group servers
 
@@ -41,9 +44,7 @@ cvar_t  *sv_timescale_time;
 cvar_t  *sv_timescale_warn;
 cvar_t  *sv_timescale_kick;
 cvar_t  *sv_allow_nodelta;
-#if USE_FPS
 cvar_t  *sv_fps;
-#endif
 
 cvar_t  *sv_timeout;            // seconds without any message
 cvar_t  *sv_zombietime;         // seconds to sink messages after disconnect
@@ -80,6 +81,8 @@ cvar_t  *sv_calcpings_method;
 cvar_t  *sv_changemapcmd;
 cvar_t  *sv_max_download_size;
 cvar_t  *sv_max_packet_entities;
+cvar_t  *sv_trunc_packet_entities;
+cvar_t  *sv_prioritize_entities;
 
 cvar_t  *sv_strafejump_hack;
 cvar_t  *sv_waterjump_hack;
@@ -88,7 +91,7 @@ cvar_t  *sv_packetdup_hack;
 #endif
 cvar_t  *sv_allow_map;
 cvar_t  *sv_cinematics;
-#if !USE_CLIENT
+#if USE_SERVER
 cvar_t  *sv_recycle;
 #endif
 cvar_t  *sv_enhanced_setplayer;
@@ -105,9 +108,15 @@ cvar_t  *sv_allow_unconnected_cmds;
 
 cvar_t  *sv_lrcon_password;
 
+// KEX
+cvar_t  *sv_tick_rate;
+// KEX
+
 cvar_t  *g_features;
 
 static bool     sv_registered;
+
+static const q2proto_protocol_t q2repro_accepted_protocols[] = {Q2P_PROTOCOL_Q2REPRO};
 
 //============================================================================
 
@@ -158,6 +167,10 @@ void SV_CleanClient(client_t *client)
     for (i = 0; i < SV_BASELINES_CHUNKS; i++) {
         Z_Freep(&client->baselines[i]);
     }
+
+    // free packet entities
+    Z_Freep(&client->entities);
+    client->num_entities = 0;
 }
 
 static void print_drop_reason(client_t *client, const char *reason, clstate_t oldstate)
@@ -223,7 +236,8 @@ void SV_DropClient(client_t *client, const char *reason)
         print_drop_reason(client, reason, oldstate);
 
     // add the disconnect
-    MSG_WriteByte(svc_disconnect);
+    q2proto_svc_message_t message = {.type = Q2P_SVC_DISCONNECT};
+    q2proto_server_write(&client->q2proto_ctx, (uintptr_t)&client->io_data, &message);
     SV_ClientAddMessage(client, MSG_RELIABLE | MSG_CLEAR);
 
     if (oldstate == cs_spawned || (g_features->integer & GMF_WANT_ALL_DISCONNECTS)) {
@@ -369,7 +383,7 @@ void SV_RateInit(ratelimit_t *r, const char *s)
     r->cost = rate2credits(rate);
 }
 
-addrmatch_t *SV_MatchAddress(list_t *list, netadr_t *addr)
+addrmatch_t *SV_MatchAddress(const list_t *list, const netadr_t *addr)
 {
     addrmatch_t *match;
 
@@ -443,7 +457,7 @@ static size_t SV_StatusString(char *status)
             }
             len = Q_snprintf(entry, sizeof(entry),
                              "%i %i \"%s\"\n",
-                             cl->edict->client->ps.stats[STAT_FRAGS],
+                             SV_GetClient_Stat(cl, STAT_FRAGS),
                              cl->ping, cl->name);
             if (len >= sizeof(entry)) {
                 continue;
@@ -572,7 +586,7 @@ static void SVC_GetChallenge(void)
     unsigned    oldestTime;
 
     oldest = 0;
-    oldestTime = 0xffffffff;
+    oldestTime = UINT_MAX;
 
     // see if we already have a challenge for this ip
     for (i = 0; i < MAX_CHALLENGES; i++) {
@@ -587,7 +601,7 @@ static void SVC_GetChallenge(void)
         }
     }
 
-    challenge = Q_rand() & 0x7fffffff;
+    challenge = Q_rand() & INT_MAX;
     if (i == MAX_CHALLENGES) {
         // overwrite the oldest
         svs.challenges[oldest].challenge = challenge;
@@ -598,9 +612,12 @@ static void SVC_GetChallenge(void)
         svs.challenges[i].time = com_eventTime;
     }
 
+    char challenge_extra[64];
+    q2proto_get_challenge_extras(challenge_extra, sizeof(challenge_extra), q2repro_accepted_protocols, q_countof(q2repro_accepted_protocols));
+
     // send it back
     Netchan_OutOfBand(NS_SERVER, &net_from,
-                      "challenge %u p=34,35,36", challenge);
+                      "challenge %u %s", challenge, challenge_extra);
 }
 
 /*
@@ -631,22 +648,19 @@ typedef struct {
 
 // small hack to permit one-line return statement :)
 #define reject(...) reject_printf(__VA_ARGS__), false
-#define reject2(...) reject_printf(__VA_ARGS__), NULL
+#define reject_ptr(...) reject_printf(__VA_ARGS__), NULL
 
-static bool parse_basic_params(conn_params_t *p)
+static bool parse_basic_params(const q2proto_connect_t *parsed_connect, conn_params_t *p)
 {
-    p->protocol = Q_atoi(Cmd_Argv(1));
-    p->qport = Q_atoi(Cmd_Argv(2)) ;
-    p->challenge = Q_atoi(Cmd_Argv(3));
+    p->protocol = q2proto_get_protocol_netver(parsed_connect->protocol);
+    p->qport = parsed_connect->qport;
+    p->challenge = parsed_connect->challenge;
 
-    // check for invalid protocol version
-    if (p->protocol < PROTOCOL_VERSION_OLD ||
-        p->protocol > PROTOCOL_VERSION_Q2PRO)
-        return reject("Unsupported protocol version %d.\n", p->protocol);
-
-    // check for valid, but outdated protocol version
-    if (p->protocol < PROTOCOL_VERSION_DEFAULT)
-        return reject("You need Quake 2 version 3.19 or higher.\n");
+    /* Reject any client that doesn't support the rerelease features -
+     * Old clients can't support certain things, particularly
+     * game-controlled pmove. */
+    if (p->protocol != PROTOCOL_VERSION_RERELEASE)
+        return reject("You need a 'rerelease' capable client to connect to this server.\n");
 
     return true;
 }
@@ -726,24 +740,15 @@ static bool permit_connection(conn_params_t *p)
     return true;
 }
 
-static bool parse_packet_length(conn_params_t *p)
+static bool parse_packet_length(const q2proto_connect_t *parsed_connect, conn_params_t *p)
 {
-    char *s;
+    p->maxlength = parsed_connect->packet_length;
+    if (p->maxlength < 0 || p->maxlength > MAX_PACKETLEN_WRITABLE)
+        return reject("Invalid maximum message length.\n");
 
-    // set maximum packet length
-    p->maxlength = MAX_PACKETLEN_WRITABLE_DEFAULT;
-    if (p->protocol >= PROTOCOL_VERSION_R1Q2) {
-        s = Cmd_Argv(5);
-        if (*s) {
-            p->maxlength = Q_atoi(s);
-            if (p->maxlength < 0 || p->maxlength > MAX_PACKETLEN_WRITABLE)
-                return reject("Invalid maximum message length.\n");
-
-            // 0 means highest available
-            if (!p->maxlength)
-                p->maxlength = MAX_PACKETLEN_WRITABLE;
-        }
-    }
+    // 0 means highest available
+    if (!p->maxlength)
+        p->maxlength = MAX_PACKETLEN_WRITABLE;
 
     if (!NET_IsLocalAddress(&net_from) && net_maxmsglen->integer > 0) {
         // cap to server defined maximum value
@@ -758,61 +763,19 @@ static bool parse_packet_length(conn_params_t *p)
     return true;
 }
 
-static bool parse_enhanced_params(conn_params_t *p)
+static bool parse_enhanced_params(const q2proto_connect_t *parsed_connect, conn_params_t *p)
 {
-    char *s;
+    p->version = parsed_connect->version;
+    p->has_zlib = parsed_connect->has_zlib;
+    p->nctype = parsed_connect->q2pro_nctype;
 
-    if (p->protocol == PROTOCOL_VERSION_R1Q2) {
-        // set minor protocol version
-        s = Cmd_Argv(6);
-        if (*s) {
-            p->version = Q_clip(Q_atoi(s),
-                PROTOCOL_VERSION_R1Q2_MINIMUM,
-                PROTOCOL_VERSION_R1Q2_CURRENT);
-        } else {
-            p->version = PROTOCOL_VERSION_R1Q2_MINIMUM;
-        }
-        p->nctype = NETCHAN_OLD;
-        p->has_zlib = true;
-    } else if (p->protocol == PROTOCOL_VERSION_Q2PRO) {
-        // set netchan type
-        s = Cmd_Argv(6);
-        if (*s) {
-            p->nctype = Q_atoi(s);
-            if (p->nctype < NETCHAN_OLD || p->nctype > NETCHAN_NEW)
-                return reject("Invalid netchan type.\n");
-        } else {
-            p->nctype = NETCHAN_NEW;
-        }
-
-        // set zlib
-        s = Cmd_Argv(7);
-        p->has_zlib = !*s || Q_atoi(s);
-
-        // set minor protocol version
-        s = Cmd_Argv(8);
-        if (*s) {
-            p->version = Q_clip(Q_atoi(s),
-                PROTOCOL_VERSION_Q2PRO_MINIMUM,
-                PROTOCOL_VERSION_Q2PRO_CURRENT);
-            if (p->version == PROTOCOL_VERSION_Q2PRO_RESERVED) {
-                p->version--; // never use this version
-            }
-        } else {
-            p->version = PROTOCOL_VERSION_Q2PRO_MINIMUM;
-        }
-    }
-
-    if (!CLIENT_COMPATIBLE(&svs.csr, p)) {
-        return reject("This is a protocol limit removing enhanced server.\n"
-                      "Your client version is not compatible. Make sure you are "
-                      "running latest Q2PRO client version.\n");
-    }
+    if (p->nctype != NETCHAN_NEW)
+        return reject("Invalid netchan type.\n");
 
     return true;
 }
 
-static char *userinfo_ip_string(void)
+static const char *userinfo_ip_string(void)
 {
     // fake up reserved IPv4 address to prevent IPv6 unaware mods from exploding
     if (net_from.type == NA_IP6 && !(g_features->integer & GMF_IPV6_ADDRESS_AWARE)) {
@@ -831,26 +794,28 @@ static char *userinfo_ip_string(void)
     return NET_AdrToString(&net_from);
 }
 
-static bool parse_userinfo(conn_params_t *params, char *userinfo)
+static bool parse_userinfo(const q2proto_connect_t *parsed_connect, conn_params_t *params, char *userinfo)
 {
-    char *info, *s;
+    char *s;
     cvarban_t *ban;
 
     // validate userinfo
-    info = Cmd_Argv(4);
-    if (!info[0])
+    if (parsed_connect->userinfo.len == 0)
         return reject("Empty userinfo string.\n");
 
-    if (!Info_Validate(info))
+    // copy userinfo off
+    q2pslcpy(userinfo, MAX_INFO_STRING, &parsed_connect->userinfo);
+
+    if (!Info_Validate(userinfo))
         return reject("Malformed userinfo string.\n");
 
-    s = Info_ValueForKey(info, "name");
+    s = Info_ValueForKey(userinfo, "name");
     s[MAX_CLIENT_NAME - 1] = 0;
     if (COM_IsWhite(s))
         return reject("Please set your name before connecting.\n");
 
     // check password
-    s = Info_ValueForKey(info, "password");
+    s = Info_ValueForKey(userinfo, "password");
     if (sv_password->string[0]) {
         if (!s[0])
             return reject("Please set your password before connecting.\n");
@@ -871,9 +836,6 @@ static bool parse_userinfo(conn_params_t *params, char *userinfo)
         // anyone to access reserved slots at all
         params->reserved = sv_reserved_slots->integer;
     }
-
-    // copy userinfo off
-    Q_strlcpy(userinfo, info, MAX_INFO_STRING);
 
     // mvdspec, ip, etc are passed in extra userinfo if supported
     if (!(g_features->integer & GMF_EXTRA_USERINFO)) {
@@ -946,6 +908,8 @@ static client_t *find_client_slot(conn_params_t *params)
     if (*s == '!' && sv_reserved_slots->integer == params->reserved)
         return redirect(s + 1);
 
+    // FIXME: Use ClientChooseSlot()
+
     // find a free client slot
     for (i = 0; i < sv_maxclients->integer - params->reserved; i++) {
         cl = &svs.client_pool[i];
@@ -955,60 +919,38 @@ static client_t *find_client_slot(conn_params_t *params)
 
     // clients that know the password are never redirected
     if (sv_reserved_slots->integer != params->reserved)
-        return reject2("Server and reserved slots are full.\n");
+        return reject_ptr("Server and reserved slots are full.\n");
 
     // optionally redirect them to a different address
     if (*s)
         return redirect(s);
 
-    return reject2("Server is full.\n");
+    return reject_ptr("Server is full.\n");
 }
 
 static void init_pmove_and_es_flags(client_t *newcl)
 {
-    int force;
-
     // copy default pmove parameters
-    newcl->pmp = sv_pmp;
+    newcl->pmp = svs.pmp;
     newcl->pmp.airaccelerate = sv_airaccelerate->integer;
 
     // common extensions
-    force = 2;
-    if (newcl->protocol >= PROTOCOL_VERSION_R1Q2) {
-        newcl->pmp.speedmult = 2;
-        force = 1;
-    }
-    newcl->pmp.strafehack = sv_strafejump_hack->integer >= force;
+    newcl->pmp.speedmult = 2;
+    newcl->pmp.strafehack = sv_strafejump_hack->integer >= 1;
 
-    // r1q2 extensions
-    if (newcl->protocol == PROTOCOL_VERSION_R1Q2) {
-        newcl->esFlags |= MSG_ES_BEAMORIGIN;
-        if (newcl->version >= PROTOCOL_VERSION_R1Q2_LONG_SOLID) {
-            newcl->esFlags |= MSG_ES_LONGSOLID;
-        }
+    // Q2PRO extensions
+    if (sv_qwmod->integer) {
+        PmoveEnableQW(&newcl->pmp);
     }
-
-    // q2pro extensions
-    force = 2;
-    if (newcl->protocol == PROTOCOL_VERSION_Q2PRO) {
-        if (sv_qwmod->integer) {
-            PmoveEnableQW(&newcl->pmp);
-        }
-        newcl->pmp.flyhack = true;
-        newcl->pmp.flyfriction = 4;
-        newcl->esFlags |= MSG_ES_UMASK | MSG_ES_LONGSOLID;
-        if (newcl->version >= PROTOCOL_VERSION_Q2PRO_BEAM_ORIGIN) {
-            newcl->esFlags |= MSG_ES_BEAMORIGIN;
-        }
-        if (newcl->version >= PROTOCOL_VERSION_Q2PRO_SHORT_ANGLES) {
-            newcl->esFlags |= MSG_ES_SHORTANGLES;
-        }
-        if (svs.csr.extended) {
-            newcl->esFlags |= MSG_ES_EXTENSIONS;
-        }
-        force = 1;
-    }
-    newcl->pmp.waterhack = sv_waterjump_hack->integer >= force;
+    newcl->pmp.flyhack = true;
+    newcl->pmp.flyfriction = 4;
+    newcl->esFlags |= MSG_ES_UMASK | MSG_ES_LONGSOLID;
+    newcl->esFlags |= MSG_ES_BEAMORIGIN;
+    newcl->esFlags |= MSG_ES_SHORTANGLES;
+    newcl->esFlags |= MSG_ES_EXTENSIONS;
+    newcl->esFlags |= MSG_ES_RERELEASE;
+    newcl->psFlags = MSG_PS_RERELEASE | MSG_PS_EXTENSIONS;
+    newcl->pmp.waterhack = sv_waterjump_hack->integer >= 1;
 }
 
 static void send_connect_packet(client_t *newcl, int nctype)
@@ -1018,12 +960,10 @@ static void send_connect_packet(client_t *newcl, int nctype)
     const char *dlstring1   = "";
     const char *dlstring2   = "";
 
-    if (newcl->protocol == PROTOCOL_VERSION_Q2PRO) {
-        if (nctype == NETCHAN_NEW)
-            ncstring = " nc=1";
-        else
-            ncstring = " nc=0";
-    }
+    if (nctype == NETCHAN_NEW)
+        ncstring = " nc=1";
+    else
+        ncstring = " nc=0";
 
     if (!sv_force_reconnect->string[0] || newcl->reconnect_var[0])
         acstring = AC_ClientConnect(newcl);
@@ -1065,18 +1005,30 @@ static void SVC_DirectConnect(void)
     qboolean        allow;
     char            *reason;
 
+    q2proto_connect_t parsed_connect;
+    q2proto_error_t parse_err = q2proto_parse_connect(Cmd_Args(), q2repro_accepted_protocols, q_countof(q2repro_accepted_protocols), &svs.server_info, &parsed_connect);
+    if (parse_err != Q2P_ERR_SUCCESS) {
+        if (parse_err == Q2P_ERR_PROTOCOL_NOT_SUPPORTED) {
+            reject_printf("Unsupported protocol %d.\n", parsed_connect.protocol);
+            return;
+        } else {
+            reject_printf("'connect' parse error %d.\n", parse_err);
+            return;
+        }
+    }
+
     memset(&params, 0, sizeof(params));
 
     // parse and validate parameters
-    if (!parse_basic_params(&params))
+    if (!parse_basic_params(&parsed_connect, &params))
         return;
     if (!permit_connection(&params))
         return;
-    if (!parse_packet_length(&params))
+    if (!parse_packet_length(&parsed_connect, &params))
         return;
-    if (!parse_enhanced_params(&params))
+    if (!parse_enhanced_params(&parsed_connect, &params))
         return;
-    if (!parse_userinfo(&params, userinfo))
+    if (!parse_userinfo(&parsed_connect, &params, userinfo))
         return;
 
     // find a free client slot
@@ -1090,11 +1042,10 @@ static void SVC_DirectConnect(void)
     // accept the new client
     // this is the only place a client_t is ever initialized
     memset(newcl, 0, sizeof(*newcl));
-    newcl->number = newcl->slot = number;
+    newcl->number = newcl->infonum = number;
     newcl->challenge = params.challenge; // save challenge for checksumming
     newcl->protocol = params.protocol;
     newcl->version = params.version;
-    newcl->has_zlib = params.has_zlib;
     newcl->edict = EDICT_NUM(number + 1);
     newcl->gamedir = fs_game->string;
     newcl->mapname = sv.name;
@@ -1107,9 +1058,19 @@ static void SVC_DirectConnect(void)
     Q_strlcpy(newcl->reconnect_var, params.reconnect_var, sizeof(newcl->reconnect_var));
     Q_strlcpy(newcl->reconnect_val, params.reconnect_val, sizeof(newcl->reconnect_val));
 #if USE_FPS
-    newcl->framediv = sv.frametime.div;
-    newcl->settings[CLS_FPS] = BASE_FRAMERATE;
+    // Rerelease protocol assumes client framerate is always in sync
+    newcl->framediv = 1;
+    newcl->settings[CLS_FPS] = sv.framerate;
 #endif
+    newcl->q2proto_deflate.z_buffer = svs.z_buffer;
+    newcl->q2proto_deflate.z_buffer_size = svs.z_buffer_size;
+    newcl->q2proto_deflate.z = &svs.z;
+
+    q2proto_error_t err = q2proto_init_servercontext(&newcl->q2proto_ctx, &svs.server_info, &parsed_connect);
+    if (err != Q2P_ERR_SUCCESS) {
+        Com_EPrintf("failed to initialize connection context: %d\n", err);
+        return;
+    }
 
     init_pmove_and_es_flags(newcl);
 
@@ -1118,7 +1079,7 @@ static void SVC_DirectConnect(void)
     // get the game a chance to reject this connection or modify the userinfo
     sv_client = newcl;
     sv_player = newcl->edict;
-    allow = ge->ClientConnect(newcl->edict, userinfo);
+    allow = ge->ClientConnect(newcl->edict, userinfo, "", false);
     sv_client = NULL;
     sv_player = NULL;
     if (!allow) {
@@ -1136,6 +1097,10 @@ static void SVC_DirectConnect(void)
                   params.qport, params.maxlength, params.protocol);
     newcl->numpackets = 1;
 
+    newcl->io_data.sz_read = &msg_read;
+    newcl->io_data.sz_write = &msg_write;
+    newcl->io_data.max_msg_len = newcl->netchan.maxpacketlen;
+
     // parse some info from the info strings
     Q_strlcpy(newcl->userinfo, userinfo, sizeof(newcl->userinfo));
     SV_UserinfoChanged(newcl);
@@ -1147,11 +1112,7 @@ static void SVC_DirectConnect(void)
 
     SV_InitClientSend(newcl);
 
-    if (newcl->protocol == PROTOCOL_VERSION_DEFAULT) {
-        newcl->WriteFrame = SV_WriteFrameToClient_Default;
-    } else {
-        newcl->WriteFrame = SV_WriteFrameToClient_Enhanced;
-    }
+    newcl->WriteFrame = SV_WriteFrameToClient_Enhanced;
 
     // loopback client doesn't need to reconnect
     if (NET_IsLocalAddress(&net_from)) {
@@ -1339,14 +1300,14 @@ int SV_CountClients(void)
     return count;
 }
 
-static int ping_nop(client_t *cl)
+static int ping_nop(const client_t *cl)
 {
     return 0;
 }
 
-static int ping_min(client_t *cl)
+static int ping_min(const client_t *cl)
 {
-    client_frame_t *frame;
+    const client_frame_t *frame;
     int i, j, count = INT_MAX;
 
     for (i = 0; i < UPDATE_BACKUP; i++) {
@@ -1363,9 +1324,9 @@ static int ping_min(client_t *cl)
     return count == INT_MAX ? 0 : count;
 }
 
-static int ping_avg(client_t *cl)
+static int ping_avg(const client_t *cl)
 {
-    client_frame_t *frame;
+    const client_frame_t *frame;
     int i, j, total = 0, count = 0;
 
     for (i = 0; i < UPDATE_BACKUP; i++) {
@@ -1392,7 +1353,7 @@ Updates the cl->ping and cl->fps variables
 static void SV_CalcPings(void)
 {
     client_t    *cl;
-    int         (*calc)(client_t *);
+    int         (*calc)(const client_t *);
     int         res;
 
     switch (sv_calcpings_method->integer) {
@@ -1429,7 +1390,7 @@ static void SV_CalcPings(void)
         }
 
         // let the game dll know about the ping
-        cl->edict->client->ping = cl->ping;
+        SV_SetClient_Ping(cl, cl->ping);
     }
 }
 
@@ -1509,15 +1470,7 @@ static void SV_PacketEvent(void)
 
         // read the qport out of the message so we can fix up
         // stupid address translating routers
-        if (client->protocol == PROTOCOL_VERSION_DEFAULT) {
-            if (msg_read.cursize < PACKET_HEADER) {
-                continue;
-            }
-            qport = RL16(&msg_read.data[8]);
-            if (netchan->qport != qport) {
-                continue;
-            }
-        } else if (netchan->qport) {
+        if (netchan->qport) {
             if (msg_read.cursize < PACKET_HEADER - 1) {
                 continue;
             }
@@ -1595,7 +1548,7 @@ static void update_client_mtu(client_t *client, int ee_info)
 SV_ErrorEvent
 =================
 */
-void SV_ErrorEvent(netadr_t *from, int ee_errno, int ee_info)
+void SV_ErrorEvent(const netadr_t *from, int ee_errno, int ee_info)
 {
     client_t    *client;
     netchan_t   *netchan;
@@ -1647,6 +1600,11 @@ static void SV_CheckTimeouts(void)
     unsigned    delta;
 
     FOR_EACH_CLIENT(client) {
+        if (Netchan_SeqTooBig(&client->netchan)) {
+            SV_DropClient(client, "outgoing sequence too big");
+            continue;
+        }
+
         // never timeout local clients
         if (NET_IsLocalAddress(&client->netchan.remote_address)) {
             continue;
@@ -1700,30 +1658,10 @@ player processing happens outside RunWorldFrame
 */
 static void SV_PrepWorldFrame(void)
 {
-    edict_t    *ent;
-    int        i;
-
-#if USE_MVD_CLIENT
-    if (sv.state == ss_broadcast) {
-        MVD_PrepWorldFrame();
-        return;
-    }
-#endif
-
-    if (gex && gex->PrepFrame) {
-        gex->PrepFrame();
-        return;
-    }
-
     if (!SV_FRAMESYNC)
         return;
 
-    for (i = 1; i < ge->num_edicts; i++) {
-        ent = EDICT_NUM(i);
-
-        // events only last for a single keyframe
-        ent->s.event = 0;
-    }
+    ge->PrepFrame();
 }
 
 // pause if there is only local client on the server
@@ -1777,14 +1715,24 @@ static void SV_RunGameFrame(void)
 #if USE_CLIENT
     if (host_speeds->integer)
         time_before_game = Sys_Milliseconds();
+
+    // debug stuff is pushed via the game, so it needs
+    // to look at server time for expiry, not client time
+    GL_ExpireDebugObjects();
 #endif
 
-    ge->RunFrame();
+    // run nav stuff before frame runs
+    Nav_Frame();
+
+    ge->RunFrame(true);
 
 #if USE_CLIENT
     if (host_speeds->integer)
         time_after_game = Sys_Milliseconds();
 #endif
+
+    if (msg_write.overflowed)
+        Com_Error(ERR_DROP, "%s: message buffer overflowed", __func__);
 
     if (msg_write.cursize) {
         Com_WPrintf("Game left %u bytes "
@@ -2054,8 +2002,8 @@ void SV_UserinfoChanged(client_t *cl)
 
 void SV_RestartFilesystem(void)
 {
-    if (gex && gex->RestartFilesystem)
-        gex->RestartFilesystem();
+    if (g_restart_fs && g_restart_fs->RestartFilesystem)
+        g_restart_fs->RestartFilesystem();
 }
 
 #if USE_SYSCON
@@ -2188,9 +2136,7 @@ void SV_Init(void)
     sv_timescale_warn = Cvar_Get("sv_timescale_warn", "0", 0);
     sv_timescale_kick = Cvar_Get("sv_timescale_kick", "0", 0);
     sv_allow_nodelta = Cvar_Get("sv_allow_nodelta", "1", 0);
-#if USE_FPS
-    sv_fps = Cvar_Get("sv_fps", "10", CVAR_LATCH);
-#endif
+    sv_fps = Cvar_Get("sv_fps", "40", CVAR_LATCH);
     sv_force_reconnect = Cvar_Get("sv_force_reconnect", "", CVAR_LATCH);
     sv_show_name_changes = Cvar_Get("sv_show_name_changes", "0", 0);
 
@@ -2209,14 +2155,16 @@ void SV_Init(void)
     sv_pad_packets = Cvar_Get("sv_pad_packets", "0", 0);
 #endif
     sv_lan_force_rate = Cvar_Get("sv_lan_force_rate", "0", CVAR_LATCH);
-    sv_min_rate = Cvar_Get("sv_min_rate", "1500", CVAR_LATCH);
-    sv_max_rate = Cvar_Get("sv_max_rate", "15000", CVAR_LATCH);
+    sv_min_rate = Cvar_Get("sv_min_rate", "15000", CVAR_LATCH);
+    sv_max_rate = Cvar_Get("sv_max_rate", "60000", CVAR_LATCH);
     sv_max_rate->changed = sv_min_rate->changed = sv_rate_changed;
     sv_max_rate->changed(sv_max_rate);
     sv_calcpings_method = Cvar_Get("sv_calcpings_method", "2", 0);
     sv_changemapcmd = Cvar_Get("sv_changemapcmd", "", 0);
     sv_max_download_size = Cvar_Get("sv_max_download_size", "8388608", 0);
     sv_max_packet_entities = Cvar_Get("sv_max_packet_entities", "0", 0);
+    sv_trunc_packet_entities = Cvar_Get("sv_trunc_packet_entities", "1", 0);
+    sv_prioritize_entities = Cvar_Get("sv_prioritize_entities", "0", 0);
 
     sv_strafejump_hack = Cvar_Get("sv_strafejump_hack", "1", CVAR_LATCH);
     sv_waterjump_hack = Cvar_Get("sv_waterjump_hack", "1", CVAR_LATCH);
@@ -2225,10 +2173,10 @@ void SV_Init(void)
     sv_packetdup_hack = Cvar_Get("sv_packetdup_hack", "0", 0);
 #endif
 
-    sv_allow_map = Cvar_Get("sv_allow_map", "0", 0);
+    sv_allow_map = Cvar_Get("sv_allow_map", COM_DEDICATED ? "0" : "1", 0);
     sv_cinematics = Cvar_Get("sv_cinematics", "1", 0);
 
-#if !USE_CLIENT
+#if USE_SERVER
     sv_recycle = Cvar_Get("sv_recycle", "0", 0);
 #endif
 
@@ -2257,6 +2205,9 @@ void SV_Init(void)
     sv_lrcon_password = Cvar_Get("lrcon_password", "", CVAR_PRIVATE);
 
     Cvar_Get("sv_features", va("%d", SV_FEATURES), CVAR_ROM);
+
+    sv_tick_rate = Cvar_Get("sv_tick_rate", "40", CVAR_LATCH);
+
     g_features = Cvar_Get("g_features", "0", CVAR_ROM);
 
     init_rate_limits();
@@ -2268,7 +2219,10 @@ void SV_Init(void)
 #endif
 
     // set up default pmove parameters
-    PmoveInit(&sv_pmp);
+    PmoveInit(&svs.pmp);
+    svs.pmp.extended_server_ver = 1;
+
+    Nav_Init();
 
 #if USE_SYSCON
     SV_SetConsoleTitle();
@@ -2299,15 +2253,14 @@ static void SV_FinalMessage(const char *message, error_type_t type)
         return;
 
     if (message) {
-        MSG_WriteByte(svc_print);
-        MSG_WriteByte(PRINT_HIGH);
-        MSG_WriteString(message);
+        q2proto_svc_message_t print_msg = {.type = Q2P_SVC_PRINT, .print = {0}};
+        print_msg.print.level = PRINT_HIGH;
+        print_msg.print.string = q2proto_make_string(message);
+        q2proto_server_multicast_write(Q2P_PROTOCOL_MULTICAST_FLOAT, Q2PROTO_IOARG_SERVER_WRITE_MULTICAST, &print_msg);
     }
 
-    if (type == ERR_RECONNECT)
-        MSG_WriteByte(svc_reconnect);
-    else
-        MSG_WriteByte(svc_disconnect);
+    q2proto_svc_message_t goodbye_msg = {.type = type == ERR_RECONNECT ? Q2P_SVC_RECONNECT : Q2P_SVC_DISCONNECT};
+    q2proto_server_multicast_write(Q2P_PROTOCOL_MULTICAST_FLOAT, Q2PROTO_IOARG_SERVER_WRITE_MULTICAST, &goodbye_msg);
 
     // send it twice
     // stagger the packets to crutch operating system limited buffers
@@ -2350,6 +2303,8 @@ void SV_Shutdown(const char *finalmsg, error_type_t type)
     if (!sv_registered)
         return;
 
+    R_ClearDebugLines();    // for local system
+
 #if USE_MVD_CLIENT
     if (ge != &mvd_ge && !(type & MVD_SPAWN_INTERNAL)) {
         // shutdown MVD client now if not already running the built-in MVD game module
@@ -2369,11 +2324,11 @@ void SV_Shutdown(const char *finalmsg, error_type_t type)
 
     // free current level
     CM_FreeMap(&sv.cm);
+    Nav_Unload();
     memset(&sv, 0, sizeof(sv));
 
     // free server static data
     Z_Free(svs.client_pool);
-    Z_Free(svs.entities);
 #if USE_ZLIB
     deflateEnd(&svs.z);
     Z_Free(svs.z_buffer);

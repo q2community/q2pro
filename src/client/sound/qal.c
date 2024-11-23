@@ -22,11 +22,7 @@ with this program; if not, write to the Free Software Foundation, Inc.,
 #include "common/common.h"
 #include "common/files.h"
 
-#ifdef __APPLE__
-#include <OpenAL/alc.h>
-#else
 #include <AL/alc.h>
-#endif
 
 #define QALAPI
 #include "qal.h"
@@ -41,6 +37,7 @@ static LPALCOPENDEVICE qalcOpenDevice;
 typedef struct {
     const char *name;
     void *dest;
+    void *builtin;
 } alfunction_t;
 
 typedef struct {
@@ -48,8 +45,8 @@ typedef struct {
     const alfunction_t *functions;
 } alsection_t;
 
-#define QALC_FN(x)  { "alc"#x, &qalc##x }
-#define QAL_FN(x)   { "al"#x, &qal##x }
+#define QALC_FN(x)  { "alc"#x, &qalc##x, alc##x }
+#define QAL_FN(x)   { "al"#x, &qal##x, al##x }
 
 static const alsection_t sections[] = {
     {
@@ -86,6 +83,7 @@ static const alsection_t sections[] = {
             QAL_FN(SourceUnqueueBuffers),
             QAL_FN(Sourcef),
             QAL_FN(Sourcei),
+            QAL_FN(Source3i),
             { NULL }
         }
     },
@@ -96,6 +94,15 @@ static const alsection_t sections[] = {
             QAL_FN(Filterf),
             QAL_FN(Filteri),
             QAL_FN(GenFilters),
+            QAL_FN(GenEffects),
+            QAL_FN(DeleteEffects),
+            QAL_FN(Effecti),
+            QAL_FN(Effectiv),
+            QAL_FN(Effectf),
+            QAL_FN(Effectfv),
+            QAL_FN(GenAuxiliaryEffectSlots),
+            QAL_FN(DeleteAuxiliaryEffectSlots),
+            QAL_FN(AuxiliaryEffectSloti),
             { NULL }
         }
     },
@@ -142,6 +149,8 @@ void QAL_Shutdown(void)
 static const char *const al_drivers[] = {
 #ifdef _WIN32
     "soft_oal", "openal32"
+#elif (defined __APPLE__)
+    "libopenal.1.dylib", "libopenal.dylib"
 #else
     "libopenal.so.1", "libopenal.so"
 #endif
@@ -156,23 +165,29 @@ bool QAL_Init(void)
     al_device = Cvar_Get("al_device", "", 0);
     al_hrtf = Cvar_Get("al_hrtf", "0", 0);
 
-    for (i = 0; i < q_countof(al_drivers); i++) {
-        Sys_LoadLibrary(al_drivers[i], NULL, &handle);
-        if (handle)
-            break;
-    }
-    if (!handle)
-        return false;
+    if (!*al_device->string) {
+        for (i = 0, sec = sections; i < q_countof(sections); i++, sec++)
+            for (func = sec->functions; func->name; func++)
+                *(void **)func->dest = func->builtin;
+    } else {
+        for (i = 0; i < q_countof(al_drivers); i++) {
+            Sys_LoadLibrary(al_drivers[i], NULL, &handle);
+            if (handle)
+                break;
+        }
+        if (!handle)
+            return false;
 
-    for (i = 0, sec = sections; i < q_countof(sections); i++, sec++) {
-        if (sec->extension)
-            continue;
+        for (i = 0, sec = sections; i < q_countof(sections); i++, sec++) {
+            if (sec->extension)
+                continue;
 
-        for (func = sec->functions; func->name; func++) {
-            void *addr = Sys_GetProcAddress(handle, func->name);
-            if (!addr)
-                goto fail;
-            *(void **)func->dest = addr;
+            for (func = sec->functions; func->name; func++) {
+                void *addr = Sys_GetProcAddress(handle, func->name);
+                if (!addr)
+                    goto fail;
+                *(void **)func->dest = addr;
+            }
         }
     }
 
@@ -200,29 +215,31 @@ bool QAL_Init(void)
         Com_SetLastError("alcMakeContextCurrent failed");
         goto fail;
     }
+    
+    if (*al_device->string) {
+        for (i = 0, sec = sections; i < q_countof(sections); i++, sec++) {
+            if (!sec->extension)
+                continue;
+            if (!qalcIsExtensionPresent(device, sec->extension))
+                continue;
 
-    for (i = 0, sec = sections; i < q_countof(sections); i++, sec++) {
-        if (!sec->extension)
-            continue;
-        if (!qalcIsExtensionPresent(device, sec->extension))
-            continue;
+            for (func = sec->functions; func->name; func++) {
+                void *addr = qalGetProcAddress(func->name);
+                if (!addr)
+                    break;
+                *(void **)func->dest = addr;
+            }
 
-        for (func = sec->functions; func->name; func++) {
-            void *addr = qalGetProcAddress(func->name);
-            if (!addr)
-                break;
-            *(void **)func->dest = addr;
+            if (func->name) {
+                for (func = sec->functions; func->name; func++)
+                    *(void **)func->dest = NULL;
+
+                Com_EPrintf("Couldn't load extension %s\n", sec->extension);
+                continue;
+            }
+
+            Com_DPrintf("Loaded extension %s\n", sec->extension);
         }
-
-        if (func->name) {
-            for (func = sec->functions; func->name; func++)
-                *(void **)func->dest = NULL;
-
-            Com_EPrintf("Couldn't load extension %s\n", sec->extension);
-            continue;
-        }
-
-        Com_DPrintf("Loaded extension %s\n", sec->extension);
     }
 
     al_device->flags |= CVAR_SOUND;

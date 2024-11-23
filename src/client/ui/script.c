@@ -51,7 +51,7 @@ static const cmd_option_t o_common[] = {
 static void add_string(menuSpinControl_t *s, const char *tok)
 {
     if (s->numItems < MAX_MENU_ITEMS) {
-        s->itemnames = Z_Realloc(s->itemnames, ALIGN(s->numItems + 2, MIN_MENU_ITEMS) * sizeof(char *));
+        s->itemnames = Z_Realloc(s->itemnames, Q_ALIGN(s->numItems + 2, MIN_MENU_ITEMS) * sizeof(char *));
         s->itemnames[s->numItems++] = UI_CopyString(tok);
     }
 }
@@ -155,6 +155,96 @@ static void Parse_Spin(menuFrameWork_t *menu, menuType_t type)
     Menu_AddItem(menu, s);
 }
 
+static void Parse_EpisodeSelector(menuFrameWork_t *menu)
+{
+    menuEpisodeSelector_t *s;
+    int c;
+    char *status = NULL;
+
+    while ((c = Cmd_ParseOptions(o_common)) != -1) {
+        switch (c) {
+        case 's':
+            status = cmd_optarg;
+            break;
+        default:
+            return;
+        }
+    }
+
+    s = UI_Mallocz(sizeof(*s));
+    s->spin.generic.type = MTYPE_EPISODE;
+    s->spin.generic.name = UI_CopyString(Cmd_Argv(cmd_optind));
+    s->spin.generic.status = UI_CopyString(status);
+    s->spin.cvar = Cvar_WeakGet(Cmd_Argv(cmd_optind + 1));
+
+    UI_MapDB_FetchEpisodes(&s->spin.itemnames, &s->spin.numItems);
+
+    Menu_AddItem(menu, s);
+}
+
+static void Parse_UnitSelector(menuFrameWork_t *menu)
+{
+    menuUnitSelector_t *s;
+    int c;
+    char *status = NULL;
+
+    while ((c = Cmd_ParseOptions(o_common)) != -1) {
+        switch (c) {
+        case 's':
+            status = cmd_optarg;
+            break;
+        default:
+            return;
+        }
+    }
+
+    s = UI_Mallocz(sizeof(*s));
+    s->spin.generic.type = MTYPE_UNIT;
+    s->spin.generic.name = UI_CopyString(Cmd_Argv(cmd_optind));
+    s->spin.generic.status = UI_CopyString(status);
+    s->spin.cvar = Cvar_WeakGet(Cmd_Argv(cmd_optind + 1));
+    s->spin.generic.uiFlags |= UI_MULTILINE;
+
+    UI_MapDB_FetchUnits(&s->spin.itemnames, &s->itemindices, &s->spin.numItems);
+
+    Menu_AddItem(menu, s);
+}
+
+static void Parse_ImageSpin(menuFrameWork_t *menu, menuType_t type)
+{
+    menuSpinControl_t *s;
+    int c, numItems;
+    char *status = NULL;
+
+    while ((c = Cmd_ParseOptions(o_common)) != -1) {
+        switch (c) {
+        case 's':
+            status = cmd_optarg;
+            break;
+        default:
+            return;
+        }
+    }
+
+    numItems = Cmd_Argc() - (cmd_optind + 2);
+    if (numItems < 1) {
+        Com_Printf("Usage: %s <name> <cvar> <path filter>\n", Cmd_Argv(0));
+        return;
+    }
+
+    s = UI_Mallocz(sizeof(*s));
+    s->generic.type = type;
+    s->generic.name = UI_CopyString(Cmd_Argv(cmd_optind));
+    s->generic.status = UI_CopyString(status);
+    s->cvar = Cvar_WeakGet(Cmd_Argv(cmd_optind + 1));
+    s->path = UI_CopyString(Cmd_Argv(cmd_optind + 2));
+    s->filter = UI_CopyString(Cmd_Argv(cmd_optind + 3));
+    s->generic.width = atoi(Cmd_Argv(cmd_optind + 4));
+    s->generic.height = atoi(Cmd_Argv(cmd_optind + 5));
+
+    Menu_AddItem(menu, s);
+}
+
 static void Parse_Pairs(menuFrameWork_t *menu)
 {
     menuSpinControl_t *s;
@@ -220,10 +310,10 @@ static void Parse_Range(menuFrameWork_t *menu)
     s->generic.name = UI_CopyString(Cmd_Argv(cmd_optind));
     s->generic.status = UI_CopyString(status);
     s->cvar = Cvar_WeakGet(Cmd_Argv(cmd_optind + 1));
-    s->minvalue = atof(Cmd_Argv(cmd_optind + 2));
-    s->maxvalue = atof(Cmd_Argv(cmd_optind + 3));
+    s->minvalue = Q_atof(Cmd_Argv(cmd_optind + 2));
+    s->maxvalue = Q_atof(Cmd_Argv(cmd_optind + 3));
     if (Cmd_Argc() - cmd_optind > 4) {
-        s->step = atof(Cmd_Argv(cmd_optind + 4));
+        s->step = Q_atof(Cmd_Argv(cmd_optind + 4));
     } else {
         s->step = (s->maxvalue - s->minvalue) / SLIDER_RANGE;
     }
@@ -510,7 +600,7 @@ static void Parse_Background(menuFrameWork_t *menu)
 
     if (SCR_ParseColor(s, &menu->color)) {
         menu->image = 0;
-        menu->transparent = menu->color.u8[3] != 255;
+        menu->transparent = menu->color.a != 255;
     } else {
         menu->image = R_RegisterPic(s);
         menu->transparent = R_GetPicSize(NULL, NULL, menu->image);
@@ -683,6 +773,12 @@ static bool Parse_File(const char *path, int depth)
                     Parse_Field(menu);
                 } else if (!strcmp(cmd, "blank")) {
                     Parse_Blank(menu);
+                } else if (!strcmp(cmd, "imagevalues")) {
+                    Parse_ImageSpin(menu, MTYPE_IMAGESPINCONTROL);
+                } else if (!strcmp(cmd, "episode_selector")) {
+                    Parse_EpisodeSelector(menu);
+                } else if (!strcmp(cmd, "unit_selector")) {
+                    Parse_UnitSelector(menu);
                 } else {
                     Com_WPrintf("Unknown keyword '%s'\n", cmd);
                 }
@@ -726,7 +822,7 @@ static bool Parse_File(const char *path, int depth)
 
                     if (SCR_ParseColor(s, &uis.color.background)) {
                         uis.backgroundHandle = 0;
-                        uis.transparent = uis.color.background.u8[3] != 255;
+                        uis.transparent = uis.color.background.a != 255;
                     } else {
                         uis.backgroundHandle = R_RegisterPic(s);
                         uis.transparent = R_GetPicSize(NULL, NULL, uis.backgroundHandle);
@@ -765,5 +861,5 @@ static bool Parse_File(const char *path, int depth)
 
 void UI_LoadScript(void)
 {
-    Parse_File("q2pro.menu", 0);
+    Parse_File(APPLICATION ".menu", 0);
 }

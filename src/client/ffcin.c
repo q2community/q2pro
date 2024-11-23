@@ -73,6 +73,7 @@ static const avformat_t formats[] = {
     { ".cin", "idcin", AV_CODEC_ID_IDCIN },
 };
 
+static char extensions[MAX_QPATH];
 static int  supported;
 
 /*
@@ -84,15 +85,22 @@ void SCR_InitCinematics(void)
 {
     for (int i = 0; i < q_countof(formats); i++) {
         const avformat_t *f = &formats[i];
-        if (!av_find_input_format(f->fmt))
+        if (!av_find_input_format(f->fmt)) {
+            Com_DDPrintf("%s not supported: no input format\n", f->fmt);
             continue;
+        }
         if (f->codec_id != AV_CODEC_ID_NONE &&
-            !avcodec_find_decoder(f->codec_id))
+            !avcodec_find_decoder(f->codec_id)) {
+            Com_DDPrintf("%s not supported: no decoder for codec ID %i\n", f->fmt, f->codec_id);
             continue;
+        }
         supported |= BIT(i);
+        if (*extensions)
+            Q_strlcat(extensions, ";", sizeof(extensions));
+        Q_strlcat(extensions, f->ext, sizeof(extensions));
     }
 
-    Com_DPrintf("Supported cinematic formats: %#x\n", supported);
+    Com_DPrintf("Supported cinematic formats: %#x (%s)\n", supported, extensions);
 }
 
 static void packet_queue_destroy(PacketQueue *q);
@@ -431,7 +439,7 @@ void SCR_DrawCinematic(void)
         if (cin.video.frame)
             R_DrawStretchRaw(x, y, w, h);
         else if (cin.static_pic)
-            R_DrawStretchPic(x, y, w, h, cin.static_pic);
+            R_DrawStretchPic(x, y, w, h, COLOR_WHITE, cin.static_pic);
     }
 }
 
@@ -667,7 +675,7 @@ SCR_PlayCinematic
 void SCR_PlayCinematic(const char *name)
 {
     // make sure CD isn't playing music
-    OGG_Stop();
+    OGG_Stop(true);
 
     if (!COM_CompareExtension(name, ".pcx")) {
         cin.static_pic = R_RegisterTempPic(name);
@@ -722,4 +730,22 @@ int SCR_CheckForCinematic(const char *name)
         ret = Q_ERR_SUCCESS;
 
     return ret;
+}
+
+/*
+==================
+SCR_Cinematic_g
+==================
+*/
+void SCR_Cinematic_g(genctx_t *ctx)
+{
+    const unsigned flags = FS_SEARCH_RECURSIVE | FS_SEARCH_STRIPEXT | FS_TYPE_REAL;
+    int count;
+    void **list;
+
+    ctx->ignoredups = true;
+    list = FS_ListFiles("video", extensions, flags, &count);
+    for (int i = 0; i < count; i++)
+        Prompt_AddMatch(ctx, va("%s.cin", (char *)list[i]));
+    FS_FreeList(list);
 }

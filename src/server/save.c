@@ -17,6 +17,7 @@ with this program; if not, write to the Free Software Foundation, Inc.,
 */
 
 #include "server.h"
+#include "common/mapdb.h"
 
 #define SAVE_MAGIC1     MakeLittleLong('S','S','V','2')
 #define SAVE_MAGIC2     MakeLittleLong('S','A','V','2')
@@ -24,6 +25,9 @@ with this program; if not, write to the Free Software Foundation, Inc.,
 
 #define SAVE_CURRENT    ".current"
 #define SAVE_AUTO       "save0"
+
+// only load saves from home dir
+#define SAVE_LOOKUP_FLAGS   (FS_TYPE_REAL | FS_PATH_GAME | FS_DIR_HOME)
 
 typedef enum {
     SAVE_MANUAL,        // manual save
@@ -39,9 +43,10 @@ typedef enum {
 
 static cvar_t   *sv_noreload;
 
+static bool have_enhanced_savegames(void);
+
 static int write_server_file(savetype_t autosave)
 {
-    char        name[MAX_OSPATH];
     cvar_t      *var;
     int         ret;
 
@@ -69,6 +74,12 @@ static int write_server_file(savetype_t autosave)
     }
     MSG_WriteString(NULL);
 
+    // check for overflow
+    if (msg_write.overflowed) {
+        SZ_Clear(&msg_write);
+        return -1;
+    }
+
     // write server state
     ret = FS_WriteFile("save/" SAVE_CURRENT "/server.ssv",
                        msg_write.data, msg_write.cursize);
@@ -79,10 +90,17 @@ static int write_server_file(savetype_t autosave)
         return -1;
 
     // write game state
-    if (Q_snprintf(name, MAX_OSPATH, "%s/save/" SAVE_CURRENT "/game.ssv", fs_gamedir) >= MAX_OSPATH)
+    size_t json_size = 0;
+    char *game_json = ge->WriteGameJson(autosave == SAVE_LEVEL_START, &json_size);
+    if (!game_json)
         return -1;
 
-    ge->WriteGame(name, autosave == SAVE_LEVEL_START);
+    ret = FS_WriteFile("save/" SAVE_CURRENT "/game.ssv",
+                       game_json, json_size);
+    Z_Free(game_json);
+    if (ret < 0)
+        return -1;
+
     return 0;
 }
 
@@ -112,7 +130,7 @@ static int write_level_file(void)
         if (!s[0])
             continue;
 
-        len = Q_strnlen(s, MAX_QPATH);
+        len = Q_strnlen(s, CS_MAX_STRING_LENGTH);
         MSG_WriteShort(i);
         MSG_WriteData(s, len);
         MSG_WriteByte(0);
@@ -136,10 +154,19 @@ static int write_level_file(void)
         return -1;
 
     // write game level
-    if (Q_snprintf(name, MAX_OSPATH, "%s/save/" SAVE_CURRENT "/%s.sav", fs_gamedir, sv.name) >= MAX_OSPATH)
+    size_t json_size = 0;
+    char *level_json = ge->WriteLevelJson(false, &json_size); // FIXME: transition flag
+    if (!level_json)
         return -1;
 
-    ge->WriteLevel(name);
+    if (Q_snprintf(name, MAX_QPATH, "save/" SAVE_CURRENT "/%s.sav", sv.name) >= MAX_QPATH)
+        ret = -1;
+    else
+        ret = FS_WriteFile(name, level_json, json_size);
+    Z_Free(level_json);
+
+    if (ret < 0)
+        return -1;
     return 0;
 }
 
@@ -201,7 +228,7 @@ static int remove_file(const char *dir, const char *name)
 static void **list_save_dir(const char *dir, int *count)
 {
     return FS_ListFiles(va("save/%s", dir), ".ssv;.sav;.sv2",
-        FS_TYPE_REAL | FS_PATH_GAME | FS_SEARCH_RECURSIVE, count);
+        SAVE_LOOKUP_FLAGS | FS_SEARCH_RECURSIVE, count);
 }
 
 static int wipe_save_dir(const char *dir)
@@ -239,7 +266,7 @@ static int read_binary_file(const char *name)
     qhandle_t f;
     int64_t len;
 
-    len = FS_OpenFile(name, &f, FS_MODE_READ | FS_TYPE_REAL | FS_PATH_GAME);
+    len = FS_OpenFile(name, &f, SAVE_LOOKUP_FLAGS | FS_MODE_READ);
     if (!f)
         return -1;
 
@@ -249,8 +276,7 @@ static int read_binary_file(const char *name)
     if (FS_Read(msg_read_buffer, len, f) != len)
         goto fail;
 
-    SZ_Init(&msg_read, msg_read_buffer, sizeof(msg_read_buffer));
-    msg_read.cursize = len;
+    SZ_InitRead(&msg_read, msg_read_buffer, len);
 
     FS_CloseFile(f);
     return 0;
@@ -258,6 +284,57 @@ static int read_binary_file(const char *name)
 fail:
     FS_CloseFile(f);
     return -1;
+}
+
+// try to fetch a friendly name from the given title.
+// - for strings with EOUs, check if there's a matching unit
+//   that we can pull the unit name from.
+// - if no EOU, check if the BSP exists at all stand-alone.
+static void SV_GetFriendlyMapDBTitle(char *name, size_t name_len)
+{
+    int i = 0;
+    const mapdb_t *mapdb = MapDB_Get();
+    const char *bsp_name = strrchr(name, '+');
+
+    if (!bsp_name)
+        bsp_name = name;
+    else
+        bsp_name++;
+
+    if (*bsp_name == '*')
+        bsp_name++;
+
+    mapcmd_t cmd = { 0 };
+    Q_strlcpy(cmd.buffer, bsp_name, sizeof(cmd.buffer));
+
+    if (!SV_ParseMapCmd(&cmd))
+        return;
+
+    // the BSP needs to exist for short episode listing
+    // TODO: hash mapping for names
+    const mapdb_map_t *mapdb_map = NULL;
+
+    for (mapdb_map = mapdb->maps, i = 0; i < mapdb->num_maps; mapdb_map++, i++)
+        if (!mapdb_map->sp && !strcmp(mapdb_map->bsp, cmd.server))
+            break;
+
+    // no idea what map this came from
+    if (i == mapdb->num_maps)
+        return;
+
+    // find a matching unit
+    const mapdb_map_t *mapdb_unit = NULL;
+    
+    for (mapdb_unit = mapdb->maps, i = 0; i < mapdb->num_maps; mapdb_unit++, i++)
+        if (mapdb_unit->sp && !strcmp(mapdb_unit->bsp, name))
+            break;
+
+    if (i != mapdb->num_maps) {
+        Q_snprintf(name, name_len, "[%s] %s", mapdb_map->short_name, mapdb_unit->title);
+        return;
+    }
+    
+    Q_snprintf(name, name_len, "[%s] %s", mapdb_map->short_name, mapdb_map->title);
 }
 
 char *SV_GetSaveInfo(const char *dir)
@@ -284,7 +361,10 @@ char *SV_GetSaveInfo(const char *dir)
     // read the comment field
     timestamp = MSG_ReadLong64();
     autosave = MSG_ReadByte();
+    MSG_ReadString(NULL, 0);
     MSG_ReadString(name, sizeof(name));
+
+    SV_GetFriendlyMapDBTitle(name, sizeof(name));
 
     if (autosave == SAVE_LEVEL_START)
         return Z_CopyString(va("ENTERING %s", name));
@@ -321,6 +401,7 @@ static int read_server_file(void)
 {
     char        name[MAX_OSPATH], string[MAX_STRING_CHARS];
     mapcmd_t    cmd;
+    void        *buf;
 
     // errors like missing file, bad version, etc are
     // non-fatal and just return to the command handler
@@ -378,14 +459,15 @@ static int read_server_file(void)
     SV_InitGame(MVD_SPAWN_DISABLED);
 
     // error out immediately if game doesn't support safe savegames
-    if (!(g_features->integer & GMF_ENHANCED_SAVEGAMES))
+    if (!have_enhanced_savegames())
         Com_Error(ERR_DROP, "Game does not support enhanced savegames");
 
     // read game state
-    if (Q_snprintf(name, MAX_OSPATH, "%s/save/" SAVE_CURRENT "/game.ssv", fs_gamedir) >= MAX_OSPATH)
-        Com_Error(ERR_DROP, "Savegame path too long");
-
-    ge->ReadGame(name);
+    FS_LoadFile("save/" SAVE_CURRENT "/game.ssv", (void **)&buf);
+    if (!buf)
+        Com_Error(ERR_DROP, "Couldn't read game.ssv");
+    ge->ReadGameJson(buf);
+    Z_Free(buf);
 
     // clear pending CM
     Com_AbortFunc(NULL, NULL);
@@ -405,12 +487,11 @@ static int read_level_file(void)
     if (Q_snprintf(name, MAX_QPATH, "save/" SAVE_CURRENT "/%s.sv2", sv.name) >= MAX_QPATH)
         return -1;
 
-    len = FS_LoadFileEx(name, &data, FS_TYPE_REAL | FS_PATH_GAME, TAG_SERVER);
+    len = FS_LoadFileEx(name, &data, SAVE_LOOKUP_FLAGS, TAG_SERVER);
     if (!data)
         return -1;
 
-    SZ_Init(&msg_read, data, len);
-    msg_read.cursize = len;
+    SZ_InitRead(&msg_read, data, len);
 
     if (MSG_ReadLong() != SAVE_MAGIC2) {
         FS_FreeFile(data);
@@ -437,7 +518,7 @@ static int read_level_file(void)
         if (index < 0 || index >= svs.csr.end)
             Com_Error(ERR_DROP, "Bad savegame configstring index");
 
-        maxlen = CS_SIZE(&svs.csr, index);
+        maxlen = Com_ConfigstringSize(&svs.csr, index);
         if (MSG_ReadString(sv.configstrings[index], maxlen) >= maxlen)
             Com_Error(ERR_DROP, "Savegame configstring too long");
     }
@@ -451,16 +532,20 @@ static int read_level_file(void)
     FS_FreeFile(data);
 
     // read game level
-    if (Q_snprintf(name, MAX_OSPATH, "%s/save/" SAVE_CURRENT "/%s.sav", fs_gamedir, sv.name) >= MAX_OSPATH)
+    if (Q_snprintf(name, MAX_OSPATH, "save/" SAVE_CURRENT "/%s.sav", sv.name) >= MAX_OSPATH)
         Com_Error(ERR_DROP, "Savegame path too long");
 
-    ge->ReadLevel(name);
+    FS_LoadFile(name, (void **)&data);
+    if (!data)
+        Com_Error(ERR_DROP, "Couldn't read %s", name);
+    ge->ReadLevelJson(data);
+    Z_Free(data);
     return 0;
 }
 
 static bool no_save_games(void)
 {
-    if (!(g_features->integer & GMF_ENHANCED_SAVEGAMES))
+    if (!have_enhanced_savegames())
         return true;
 
     if (Cvar_VariableInteger("deathmatch"))
@@ -469,7 +554,7 @@ static bool no_save_games(void)
     return false;
 }
 
-void SV_AutoSaveBegin(const mapcmd_t *cmd)
+bool SV_AutoSaveBegin(const mapcmd_t *cmd)
 {
     byte        bitmap[MAX_CLIENTS / CHAR_BIT];
     edict_t     *ent;
@@ -478,14 +563,17 @@ void SV_AutoSaveBegin(const mapcmd_t *cmd)
     // check for clearing the current savegame
     if (cmd->endofunit) {
         wipe_save_dir(SAVE_CURRENT);
-        return;
+        return false;
     }
 
     if (sv.state != ss_game)
-        return;
+        return false;
 
     if (no_save_games())
-        return;
+        return false;
+
+    if (!ge->CanSave())
+        return false;
 
     memset(bitmap, 0, sizeof(bitmap));
 
@@ -509,16 +597,12 @@ void SV_AutoSaveBegin(const mapcmd_t *cmd)
         ent = EDICT_NUM(i + 1);
         ent->inuse = Q_IsBitSet(bitmap, i);
     }
+
+    return true;
 }
 
 void SV_AutoSaveEnd(void)
 {
-    if (sv.state != ss_game)
-        return;
-
-    if (no_save_games())
-        return;
-
     // save server state
     if (write_server_file(SAVE_LEVEL_START)) {
         Com_EPrintf("Couldn't write server file.\n");
@@ -540,6 +624,8 @@ void SV_AutoSaveEnd(void)
 
 void SV_CheckForSavegame(const mapcmd_t *cmd)
 {
+    int frames;
+
     if (no_save_games())
         return;
     if (sv_noreload->integer)
@@ -555,16 +641,21 @@ void SV_CheckForSavegame(const mapcmd_t *cmd)
 
     if (cmd->loadgame == LOAD_NORMAL) {
         // called from SV_Loadgame_f
-        ge->RunFrame();
-        ge->RunFrame();
+        frames = 2;
     } else {
-        int i;
-
         // coming back to a level after being in a different
         // level, so run it for ten seconds
-        for (i = 0; i < 100; i++)
-            ge->RunFrame();
+        frames = 10 * SV_FRAMERATE;
     }
+
+    for (int i = 0; i < frames; i++, sv.framenum++)
+        ge->RunFrame(false);
+}
+
+static bool have_enhanced_savegames(void)
+{
+    return (g_features->integer & GMF_ENHANCED_SAVEGAMES)
+        || (svs.gamedetecthack == 4) || sys_allow_unsafe_savegames->integer;
 }
 
 void SV_CheckForEnhancedSavegames(void)
@@ -572,24 +663,20 @@ void SV_CheckForEnhancedSavegames(void)
     if (Cvar_VariableInteger("deathmatch"))
         return;
 
-    if (g_features->integer & GMF_ENHANCED_SAVEGAMES) {
+    if (g_features->integer & GMF_ENHANCED_SAVEGAMES)
         Com_Printf("Game supports Q2PRO enhanced savegames.\n");
-        return;
-    }
-
-    if (sv.gamedetecthack == 4) {
+    else if (svs.gamedetecthack == 4)
         Com_Printf("Game supports YQ2 enhanced savegames.\n");
-        Cvar_SetInteger(g_features, g_features->integer | GMF_ENHANCED_SAVEGAMES, FROM_CODE);
-        return;
-    }
-
-    Com_WPrintf("Game does not support enhanced savegames. Savegames will not work.\n");
+    else if (sys_allow_unsafe_savegames->integer)
+        Com_WPrintf("Use of unsafe savegames forced from command line.\n");
+    else
+        Com_WPrintf("Game does not support enhanced savegames. Savegames will not work.\n");
 }
 
 static void SV_Savegame_c(genctx_t *ctx, int argnum)
 {
     if (argnum == 1) {
-        FS_File_g("save", NULL, FS_SEARCH_DIRSONLY | FS_TYPE_REAL | FS_PATH_GAME, ctx);
+        FS_File_g("save", NULL, SAVE_LOOKUP_FLAGS | FS_SEARCH_DIRSONLY, ctx);
     }
 }
 
@@ -609,8 +696,8 @@ static void SV_Loadgame_f(void)
     }
 
     // make sure the server files exist
-    if (!FS_FileExistsEx(va("save/%s/server.ssv", dir), FS_TYPE_REAL | FS_PATH_GAME) ||
-        !FS_FileExistsEx(va("save/%s/game.ssv", dir), FS_TYPE_REAL | FS_PATH_GAME)) {
+    if (!FS_FileExistsEx(va("save/%s/server.ssv", dir), SAVE_LOOKUP_FLAGS) ||
+        !FS_FileExistsEx(va("save/%s/game.ssv", dir), SAVE_LOOKUP_FLAGS)) {
         Com_Printf("No such savegame: %s\n", dir);
         return;
     }
@@ -645,7 +732,7 @@ static void SV_Savegame_f(void)
     }
 
     // don't bother saving if we can't read them back!
-    if (!(g_features->integer & GMF_ENHANCED_SAVEGAMES)) {
+    if (!have_enhanced_savegames()) {
         Com_Printf("Game does not support enhanced savegames.\n");
         return;
     }
@@ -655,30 +742,23 @@ static void SV_Savegame_f(void)
         return;
     }
 
-    if (gex && gex->CanSave) {
-        if (!gex->CanSave())
-            return;
-    } else {
-        if (sv_maxclients->integer == 1 && svs.client_pool[0].edict->client->ps.stats[STAT_HEALTH] <= 0) {
-            Com_Printf("Can't savegame while dead!\n");
-            return;
-        }
-    }
+    if (!ge->CanSave())
+        return;
 
     if (!strcmp(Cmd_Argv(0), "autosave")) {
         dir = "save1";
         type = SAVE_AUTOSAVE;
     } else {
-        if (Cmd_Argc() != 2) {
-            Com_Printf("Usage: %s <directory>\n", Cmd_Argv(0));
-            return;
-        }
+    if (Cmd_Argc() != 2) {
+        Com_Printf("Usage: %s <directory>\n", Cmd_Argv(0));
+        return;
+    }
 
-        dir = Cmd_Argv(1);
-        if (!COM_IsPath(dir)) {
-            Com_Printf("Bad savedir.\n");
-            return;
-        }
+    dir = Cmd_Argv(1);
+    if (!COM_IsPath(dir)) {
+        Com_Printf("Bad savedir.\n");
+        return;
+    }
         type = SAVE_MANUAL;
     }
 

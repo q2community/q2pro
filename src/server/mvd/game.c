@@ -450,16 +450,16 @@ static void MVD_FollowStop(mvd_client_t *client)
     client->ps.viewangles[ROLL] = 0;
 
     for (i = 0; i < 3; i++) {
-        client->ps.pmove.delta_angles[i] = ANGLE2SHORT(
-                                               client->ps.viewangles[i]) - client->lastcmd.angles[i];
+        client->ps.pmove.delta_angles[i] = ANGLE2SHORT(client->ps.viewangles[i]) - client->lastcmd.angles[i];
     }
 
     VectorClear(client->ps.kick_angles);
-    Vector4Clear(client->ps.blend);
+    Vector4Clear(client->ps.screen_blend);
     client->ps.pmove.pm_flags = 0;
     client->ps.pmove.pm_type = mvd->pm_type;
     client->ps.rdflags = 0;
     client->ps.gunindex = 0;
+    client->ps.gunskin = 0;
     client->ps.fov = client->fov;
 
     // send delta configstrings
@@ -665,7 +665,7 @@ static void MVD_UpdateClient(mvd_client_t *client)
         // get contents from world
         if (mvd->cm.cache) {
             vec3_t vieworg;
-            VectorMA(client->ps.viewoffset, 0.125f, client->ps.pmove.origin, vieworg);
+            VectorAdd(client->ps.viewoffset, client->ps.pmove.origin, vieworg);
             contents = CM_PointContents(vieworg, mvd->cm.cache->nodes);
         }
 
@@ -675,13 +675,15 @@ static void MVD_UpdateClient(mvd_client_t *client)
             client->ps.rdflags = 0;
 
         if (contents & (CONTENTS_SOLID | CONTENTS_LAVA))
-            Vector4Set(client->ps.blend, 1.0f, 0.3f, 0.0f, 0.6f);
+            Vector4Set(client->ps.screen_blend, 1.0f, 0.3f, 0.0f, 0.6f);
         else if (contents & CONTENTS_SLIME)
-            Vector4Set(client->ps.blend, 0.0f, 0.1f, 0.05f, 0.6f);
+            Vector4Set(client->ps.screen_blend, 0.0f, 0.1f, 0.05f, 0.6f);
         else if (contents & CONTENTS_WATER)
-            Vector4Set(client->ps.blend, 0.5f, 0.3f, 0.2f, 0.4f);
+            Vector4Set(client->ps.screen_blend, 0.5f, 0.3f, 0.2f, 0.4f);
         else
-            Vector4Clear(client->ps.blend);
+            Vector4Clear(client->ps.screen_blend);
+
+        Vector4Clear(client->ps.damage_blend);
     } else {
         // copy entire player state
         client->ps = target->ps;
@@ -696,7 +698,7 @@ static void MVD_UpdateClient(mvd_client_t *client)
         if (target != mvd->dummy) {
             if (mvd_stats_hack->integer && mvd->dummy) {
                 // copy stats of the dummy MVD observer
-                for (i = 0; i < MAX_STATS; i++) {
+                for (i = 0; i < MAX_STATS_OLD; i++) {
                     if (mvd_stats_hack->integer & BIT(i)) {
                         client->ps.stats[i] = mvd->dummy->ps.stats[i];
                     }
@@ -773,21 +775,32 @@ void MVD_BroadcastPrintf(mvd_t *mvd, int level, int mask, const char *fmt, ...)
     SZ_Clear(&msg_write);
 }
 
+#define ES_MASK     (MSG_ES_SHORTANGLES | MSG_ES_EXTENSIONS | MSG_ES_EXTENSIONS_2)
+#define PS_MASK     (MSG_PS_EXTENSIONS | MSG_PS_EXTENSIONS_2 | MSG_PS_MOREBITS)
+
 static void MVD_SetServerState(client_t *cl, mvd_t *mvd)
 {
+    if (cl->csr != mvd->csr) {
+        Z_Freep(&cl->entities);
+        cl->num_entities = 0;
+    }
+
     cl->gamedir = mvd->gamedir;
     cl->mapname = mvd->mapname;
     cl->configstrings = mvd->configstrings;
     cl->csr = mvd->csr;
-    cl->slot = mvd->clientNum;
+    cl->infonum = mvd->clientNum;
     cl->cm = &mvd->cm;
     cl->ge = &mvd->ge;
     cl->spawncount = mvd->servercount;
     cl->maxclients = mvd->maxclients;
-    if (cl->csr->extended)
-        cl->esFlags |= MSG_ES_SHORTANGLES | MSG_ES_EXTENSIONS;
-    else
-        cl->esFlags &= ~(MSG_ES_SHORTANGLES | MSG_ES_EXTENSIONS);
+
+    cl->esFlags &= ~ES_MASK;
+    cl->psFlags &= ~PS_MASK;
+    cl->esFlags |= mvd->esFlags & ES_MASK;
+    cl->psFlags |= mvd->psFlags & PS_MASK;
+
+    cl->esFlags |= MSG_ES_SHORTANGLES | MSG_ES_EXTENSIONS;
 }
 
 void MVD_SwitchChannel(mvd_client_t *client, mvd_t *mvd)
@@ -849,11 +862,6 @@ static void MVD_TrySwitchChannel(mvd_client_t *client, mvd_t *mvd)
                         "[MVD] You are already %s.\n", mvd == &mvd_waitingRoom ?
                         "in the Waiting Room" : "on this channel");
         return; // nothing to do
-    }
-    if (!CLIENT_COMPATIBLE(mvd->csr, client->cl)) {
-        SV_ClientPrintf(client->cl, PRINT_HIGH,
-                        "[MVD] This channel is not compatible with your client version.\n");
-        return;
     }
 
     if (client->begin_time) {
@@ -918,7 +926,7 @@ static void MVD_Forward_f(mvd_client_t *client)
 static void MVD_Say_f(mvd_client_t *client, int argnum)
 {
     mvd_t *mvd = client->mvd;
-    char text[150], hightext[150];
+    char text[150];
     mvd_client_t *other;
     client_t *cl;
     unsigned i, j, delta;
@@ -963,11 +971,6 @@ static void MVD_Say_f(mvd_client_t *client, int argnum)
     Q_snprintf(text, sizeof(text), "[MVD] %s: %s",
                client->cl->name, Cmd_ArgsFrom(argnum));
 
-    // color text for legacy clients
-    for (i = 0; text[i]; i++)
-        hightext[i] = text[i] | 128;
-    hightext[i] = 0;
-
     FOR_EACH_MVDCL(other, mvd) {
         cl = other->cl;
         if (cl->state < cs_spawned) {
@@ -977,12 +980,7 @@ static void MVD_Say_f(mvd_client_t *client, int argnum)
             continue;
         }
 
-        if (cl->protocol == PROTOCOL_VERSION_Q2PRO &&
-            cl->version >= PROTOCOL_VERSION_Q2PRO_SERVER_STATE) {
-            SV_ClientPrintf(cl, PRINT_CHAT, "%s\n", text);
-        } else {
-            SV_ClientPrintf(cl, PRINT_HIGH, "%s\n", hightext);
-        }
+        SV_ClientPrintf(cl, PRINT_CHAT, "%s\n", text);
     }
 }
 
@@ -1687,30 +1685,28 @@ MISC GAME FUNCTIONS
 
 void MVD_LinkEdict(mvd_t *mvd, edict_t *ent)
 {
-    int         index;
-    mmodel_t    *cm;
-    bsp_t       *cache = mvd->cm.cache;
+    int             index;
+    const mmodel_t  *mod;
+    const bsp_t     *bsp = mvd->cm.cache;
 
-    if (!cache) {
+    if (!bsp)
         return;
-    }
 
-    if (ent->s.solid == PACKED_BSP) {
-        index = ent->s.modelindex;
-        if (index < 1 || index > cache->nummodels) {
-            Com_WPrintf("%s: entity %d: bad inline model index: %d\n",
-                        __func__, ent->s.number, index);
-            return;
-        }
-        cm = &cache->models[index - 1];
-        VectorCopy(cm->mins, ent->mins);
-        VectorCopy(cm->maxs, ent->maxs);
-        ent->solid = SOLID_BSP;
-    } else if (ent->s.solid) {
-        if (mvd->csr->extended)
-            MSG_UnpackSolid32_Ver2(ent->s.solid, ent->mins, ent->maxs);
+    index = ent->s.modelindex - 1;
+    if (index == MODELINDEX_PLAYER - 1)
+        index = 0;
+    else if (index >= MODELINDEX_PLAYER)
+        index--;
+    if (index > 0 && index < bsp->nummodels) {
+        mod = &bsp->models[index];
+        VectorCopy(mod->mins, ent->mins);
+        VectorCopy(mod->maxs, ent->maxs);
+        if (ent->s.solid == PACKED_BSP)
+            ent->solid = SOLID_BSP;
         else
-            MSG_UnpackSolid16(ent->s.solid, ent->mins, ent->maxs);
+            ent->solid = SOLID_TRIGGER;
+    } else if (ent->s.solid && ent->s.solid != PACKED_BSP) {
+        MSG_UnpackSolid32_Ver2(ent->s.solid, ent->mins, ent->maxs);
         ent->solid = SOLID_BBOX;
     } else {
         VectorClear(ent->mins);
@@ -1718,7 +1714,10 @@ void MVD_LinkEdict(mvd_t *mvd, edict_t *ent)
         ent->solid = SOLID_NOT;
     }
 
-    SV_LinkEdict(&mvd->cm, ent);
+    int entnum = ent - mvd->edicts;
+    server_entity_t* sent = &sv.entities[entnum];
+
+    SV_LinkEdict(&mvd->cm, ent, sent);
 }
 
 void MVD_RemoveClient(client_t *client)
@@ -1730,6 +1729,10 @@ void MVD_RemoveClient(client_t *client)
 
     memset(cl, 0, sizeof(*cl));
     cl->cl = client;
+}
+
+static void MVD_GamePreInit(void)
+{
 }
 
 static void MVD_GameInit(void)
@@ -1768,7 +1771,7 @@ static void MVD_GameInit(void)
 
     for (i = 0; i < sv_maxclients->integer; i++) {
         mvd_clients[i].cl = &svs.client_pool[i];
-        edicts[i + 1].client = (gclient_t *)&mvd_clients[i];
+        edicts[i + 1].client = (struct gclient_s*)&mvd_clients[i];
     }
 
     mvd_ge.edicts = edicts;
@@ -1839,20 +1842,57 @@ static void MVD_GameShutdown(void)
 static void MVD_GameSpawnEntities(const char *mapname, const char *entstring, const char *spawnpoint)
 {
 }
-static void MVD_GameWriteGame(const char *filename, qboolean autosave)
+
+static char* MVD_GameWriteGameJson(bool autosave, size_t* json_size)
 {
+    *json_size = 0;
+    return NULL;
 }
-static void MVD_GameReadGame(const char *filename)
-{
-}
-static void MVD_GameWriteLevel(const char *filename)
-{
-}
-static void MVD_GameReadLevel(const char *filename)
+
+static void MVD_GameReadGameJson(const char *json)
 {
 }
 
-static qboolean MVD_GameClientConnect(edict_t *ent, char *userinfo)
+static char* MVD_GameWriteLevelJson(bool transition, size_t* json_size)
+{
+    *json_size = 0;
+    return NULL;
+}
+
+static void MVD_GameReadLevelJson(const char *json)
+{
+}
+
+static bool MVD_GameCanSave(void)
+{
+    return false;
+}
+
+static bool edict_ignored(edict_t *ent, edict_t **ignore, size_t num_ignore)
+{
+    for (size_t i = 0; i < num_ignore; i++) {
+        if (ent == ignore[i])
+            return true;
+    }
+    return false;
+}
+
+static edict_t *MVD_GameClientChooseSlot (const char *userinfo, const char *social_id, bool isBot, edict_t **ignore, size_t num_ignore, bool cinematic)
+{
+    client_t *cl;
+    int i;
+
+    // find a free client slot
+    for (i = 0; i < sv_maxclients->integer; i++) {
+        cl = &svs.client_pool[i];
+        if (!edict_ignored(cl->edict, ignore, num_ignore) && cl->state == cs_free)
+            return cl->edict;
+    }
+
+    return NULL;
+}
+
+static bool MVD_GameClientConnect(edict_t *ent, char *userinfo, const char *social_id, bool isBot)
 {
     mvd_client_t *client = EDICT_MVDCL(ent);
     mvd_t *mvd = NULL;
@@ -1862,7 +1902,7 @@ static qboolean MVD_GameClientConnect(edict_t *ent, char *userinfo)
     if (LIST_SINGLE(&mvd_channel_list)) {
         mvd = LIST_FIRST(mvd_t, &mvd_channel_list, entry);
     }
-    if (!mvd || !CLIENT_COMPATIBLE(mvd->csr, client->cl)) {
+    if (!mvd) {
         mvd = &mvd_waitingRoom;
     }
     List_SeqAdd(&mvd->clients, &client->entry);
@@ -1928,7 +1968,7 @@ static void MVD_GameClientBegin(edict_t *ent)
         MVD_FollowStart(client, target);
     } else {
         // spawn the spectator
-        VectorScale(mvd->spawnOrigin, 8, client->ps.pmove.origin);
+        VectorCopy(mvd->spawnOrigin, client->ps.pmove.origin);
         VectorCopy(mvd->spawnAngles, client->ps.viewangles);
         MVD_FollowStop(client);
 
@@ -1941,7 +1981,7 @@ static void MVD_GameClientBegin(edict_t *ent)
     mvd_dirty = true;
 }
 
-static void MVD_GameClientUserinfoChanged(edict_t *ent, char *userinfo)
+static void MVD_GameClientUserinfoChanged(edict_t *ent, const char *userinfo)
 {
     mvd_client_t *client = EDICT_MVDCL(ent);
     int fov;
@@ -2013,7 +2053,7 @@ static mvd_player_t *MVD_HitPlayer(mvd_client_t *client)
     if (mvd->intermission)
         return NULL;
 
-    VectorMA(client->ps.viewoffset, 0.125f, client->ps.pmove.origin, start);
+    VectorAdd(client->ps.viewoffset, client->ps.pmove.origin, start);
     AngleVectors(client->ps.viewangles, forward, NULL, NULL);
     VectorMA(start, 8192, forward, end);
 
@@ -2051,7 +2091,7 @@ static mvd_player_t *MVD_HitPlayer(mvd_client_t *client)
     return target;
 }
 
-static trace_t q_gameabi MVD_Trace(const vec3_t start, const vec3_t mins, const vec3_t maxs, const vec3_t end)
+static trace_t q_gameabi MVD_Trace(const vec3_t start, const vec3_t mins, const vec3_t maxs, const vec3_t end, const edict_t* passent, contents_t contentmask)
 {
     trace_t trace;
 
@@ -2062,7 +2102,7 @@ static trace_t q_gameabi MVD_Trace(const vec3_t start, const vec3_t mins, const 
     return trace;
 }
 
-static int MVD_PointContents(const vec3_t p)
+static contents_t MVD_PointContents(const vec3_t p)
 {
     return 0;
 }
@@ -2075,8 +2115,7 @@ static void MVD_GameClientThink(edict_t *ent, usercmd_t *cmd)
 
     if (cmd->buttons != old->buttons
         || cmd->forwardmove != old->forwardmove
-        || cmd->sidemove != old->sidemove
-        || cmd->upmove != old->upmove) {
+        || cmd->sidemove != old->sidemove) {
         // don't timeout
         mvd_last_activity = svs.realtime;
     }
@@ -2093,7 +2132,7 @@ static void MVD_GameClientThink(edict_t *ent, usercmd_t *cmd)
     }
 
     if (client->target) {
-        if (cmd->upmove >= 10) {
+        if (cmd->buttons & BUTTON_JUMP) {
             if (client->jump_held < 1) {
                 if (!client->mvd->intermission) {
                     MVD_FollowNext(client, client->target);
@@ -2101,7 +2140,7 @@ static void MVD_GameClientThink(edict_t *ent, usercmd_t *cmd)
                 }
                 client->jump_held = 1;
             }
-        } else if (cmd->upmove <= -10) {
+        } else if (cmd->buttons & BUTTON_CROUCH) {
             if (client->jump_held > -1) {
                 if (!client->mvd->intermission) {
                     MVD_FollowPrev(client, client->target);
@@ -2252,7 +2291,7 @@ fail:
     MVD_StopRecord(mvd);
 }
 
-static void MVD_GameRunFrame(void)
+static void MVD_GameRunFrame(bool main_loop)
 {
     mvd_t *mvd, *next;
     int numplayers = 0;
@@ -2291,11 +2330,7 @@ update:
     }
 }
 
-static void MVD_GameServerCommand(void)
-{
-}
-
-void MVD_PrepWorldFrame(void)
+static void MVD_GamePrepFrame(void)
 {
     mvd_t *mvd;
     edict_t *ent;
@@ -2316,17 +2351,24 @@ void MVD_PrepWorldFrame(void)
     }
 }
 
+static void MVD_GameServerCommand(void)
+{
+}
+
 
 game_export_t mvd_ge = {
     GAME_API_VERSION,
 
+    MVD_GamePreInit,
     MVD_GameInit,
     MVD_GameShutdown,
     MVD_GameSpawnEntities,
-    MVD_GameWriteGame,
-    MVD_GameReadGame,
-    MVD_GameWriteLevel,
-    MVD_GameReadLevel,
+    MVD_GameWriteGameJson,
+    MVD_GameReadGameJson,
+    MVD_GameWriteLevelJson,
+    MVD_GameReadLevelJson,
+    MVD_GameCanSave,
+    MVD_GameClientChooseSlot,
     MVD_GameClientConnect,
     MVD_GameClientBegin,
     MVD_GameClientUserinfoChanged,
@@ -2334,5 +2376,6 @@ game_export_t mvd_ge = {
     MVD_GameClientCommand,
     MVD_GameClientThink,
     MVD_GameRunFrame,
+    MVD_GamePrepFrame,
     MVD_GameServerCommand
 };

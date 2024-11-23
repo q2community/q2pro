@@ -27,6 +27,15 @@ with this program; if not, write to the Free Software Foundation, Inc.,
 #include <setjmp.h>
 #endif
 
+#if _MSC_VER >= 1930
+#define XBOX_SUPPORT
+#include <appmodel.h>
+#include <VersionHelpers.h>
+#pragma message("Xbox support enabled")
+#else
+#pragma message("No Xbox support")
+#endif
+
 HINSTANCE                       hGlobalInstance;
 
 #if USE_WINSVC
@@ -44,7 +53,9 @@ static cvar_t                   *sys_exitonerror;
 cvar_t  *sys_basedir;
 cvar_t  *sys_libdir;
 cvar_t  *sys_homedir;
-cvar_t  *sys_forcegamelib;
+#ifdef _DEBUG
+cvar_t  *sys_debugprint;
+#endif
 
 /*
 ===============================================================================
@@ -203,11 +214,10 @@ Sys_ConsoleInput
 void Sys_RunConsole(void)
 {
     INPUT_RECORD    recs[MAX_CONSOLE_INPUT_EVENTS];
-    int     ch;
-    DWORD   numread, numevents;
-    int     i;
+    int             i, ch;
+    DWORD           numread, numevents;
     inputField_t    *f = &sys_con.inputLine;
-    char    *s;
+    char            *s;
 
     if (hinput == INVALID_HANDLE_VALUE) {
         return;
@@ -490,6 +500,20 @@ void Sys_RunConsole(void)
     }
 }
 
+void Sys_LoadHistory(void)
+{
+    if (gotConsole && sys_history && sys_history->integer > 0) {
+        Prompt_LoadHistory(&sys_con, SYS_HISTORYFILE_NAME);
+    }
+}
+
+void Sys_SaveHistory(void)
+{
+    if (gotConsole && sys_history && sys_history->integer > 0) {
+        Prompt_SaveHistory(&sys_con, SYS_HISTORYFILE_NAME, sys_history->integer);
+    }
+}
+
 #define FOREGROUND_BLACK    0
 #define FOREGROUND_WHITE    (FOREGROUND_BLUE|FOREGROUND_GREEN|FOREGROUND_RED)
 
@@ -524,10 +548,10 @@ void Sys_SetConsoleColor(color_index_t color)
     attr = info.wAttributes & ~FOREGROUND_WHITE;
 
     switch (color) {
-    case COLOR_NONE:
+    case COLOR_INDEX_NONE:
         w = attr | FOREGROUND_WHITE;
         break;
-    case COLOR_ALT:
+    case COLOR_INDEX_ALT:
         w = attr | FOREGROUND_GREEN;
         break;
     default:
@@ -535,14 +559,33 @@ void Sys_SetConsoleColor(color_index_t color)
         break;
     }
 
-    if (color != COLOR_NONE) {
+    if (color != COLOR_INDEX_NONE) {
         hide_console_input();
     }
     SetConsoleTextAttribute(houtput, w);
-    if (color == COLOR_NONE) {
+    if (color == COLOR_INDEX_NONE) {
         show_console_input();
     }
 }
+
+#ifdef _DEBUG
+// hack'd version of OutputDebugStringA that can
+// be given a specific size rather than strlen'ing the input
+static void __stdcall QOutputDebugStringA(LPCSTR lpOutputString, size_t len)
+{
+    ULONG_PTR args[2];
+    args[0] = (ULONG_PTR)len;
+    args[1] = (ULONG_PTR)lpOutputString;
+ 
+    __try
+    {
+        RaiseException(DBG_PRINTEXCEPTION_C, 0, 2, args);
+    }
+    __except(EXCEPTION_EXECUTE_HANDLER)
+    {
+    }
+}
+#endif
 
 /*
 ================
@@ -553,6 +596,13 @@ Print text to the dedicated console
 */
 void Sys_ConsoleOutput(const char *text, size_t len)
 {
+#ifdef _DEBUG
+    if (sys_debugprint && sys_debugprint->integer) {
+        QOutputDebugStringA(text, len);
+        QOutputDebugStringA("\r\n", 2);
+    }
+#endif
+
     if (houtput == INVALID_HANDLE_VALUE) {
         return;
     }
@@ -769,26 +819,6 @@ MISC
 ===============================================================================
 */
 
-#if USE_SYSCON
-/*
-================
-Sys_Printf
-================
-*/
-void Sys_Printf(const char *fmt, ...)
-{
-    va_list     argptr;
-    char        msg[MAXPRINTMSG];
-    size_t      len;
-
-    va_start(argptr, fmt);
-    len = Q_vscnprintf(msg, sizeof(msg), fmt, argptr);
-    va_end(argptr);
-
-    Sys_ConsoleOutput(msg, len);
-}
-#endif
-
 /*
 ================
 Sys_Error
@@ -808,11 +838,11 @@ void Sys_Error(const char *error, ...)
 #endif
 
 #if USE_SYSCON
-    Sys_SetConsoleColor(COLOR_RED);
+    Sys_SetConsoleColor(COLOR_INDEX_RED);
     Sys_Printf("********************\n"
                "FATAL: %s\n"
                "********************\n", text);
-    Sys_SetConsoleColor(COLOR_NONE);
+    Sys_SetConsoleColor(COLOR_INDEX_NONE);
 #endif
 
 #if USE_WINSVC
@@ -900,6 +930,10 @@ Sys_Init
 */
 void Sys_Init(void)
 {
+#ifdef _DEBUG
+    sys_debugprint = Cvar_Get("sys_debugprint", "0", 0);
+#endif
+
     if (!QueryPerformanceFrequency(&timer_freq))
         Sys_Error("QueryPerformanceFrequency failed");
 
@@ -914,8 +948,6 @@ void Sys_Init(void)
     // homedir <path>
     // specifies per-user writable directory for demos, screenshots, etc
     sys_homedir = Cvar_Get("homedir", "", CVAR_NOSET);
-
-    sys_forcegamelib = Cvar_Get("sys_forcegamelib", "", CVAR_NOSET);
 
     sys_exitonerror = Cvar_Get("sys_exitonerror", "0", 0);
 
@@ -999,6 +1031,13 @@ void *Sys_GetProcAddress(void *handle, const char *sym)
     return entry;
 }
 
+#if USE_MEMORY_TRACES
+void Sys_BackTrace(void **output, size_t count, size_t offset)
+{
+    CaptureStackBackTrace(offset, count, output, NULL);
+}
+#endif
+
 /*
 ========================================================================
 
@@ -1021,6 +1060,10 @@ void Sys_ListFiles_r(listfiles_t *list, const char *path, int depth)
     unsigned    mask;
     void        *info;
     const char  *filter = list->filter;
+
+    if (list->count >= MAX_LISTED_FILES) {
+        return;
+    }
 
     // optimize single extension search
     if (!(list->flags & (FS_SEARCH_BYFILTER | FS_SEARCH_RECURSIVE)) &&
@@ -1131,6 +1174,241 @@ void Sys_ListFiles_r(listfiles_t *list, const char *path, int depth)
     } while (list->count < MAX_LISTED_FILES && _findnexti64(handle, &data) == 0);
 
     _findclose(handle);
+}
+
+/*
+========================================================================
+
+GAME PATH DETECTION
+
+========================================================================
+*/
+
+#define COM_ParseExpect(d, s) \
+    !strcmp(COM_Parse((d)), (s))
+
+static void skip_vdf_value(const char **file_contents)
+{
+    char *value = COM_Parse(file_contents);
+
+    if (!strcmp(value, "{")) {
+        while (true) {
+            COM_Parse(file_contents);
+            skip_vdf_value(file_contents);
+        }
+    }
+}
+
+#define QUAKE_II_STEAM_APP_ID           "2320"
+#define QUAKE_II_GOG_CLASSIC_APP_ID     "1441704824"
+#define QUAKE_II_GOG_RERELEASE_APP_ID   "1947927225"
+#define QUAKE_II_XBOX_FAMILY_NAME       L"BethesdaSoftworks.ProjAthena_3275kfvn8vcwc"
+
+static bool parse_vdf_apps_list(const char **file_contents)
+{
+    if (!COM_ParseExpect(file_contents, "{")) {
+        return false;
+    }
+
+    bool game_found = false;
+
+    while (true) {
+        char *key = COM_Parse(file_contents);
+
+        if (!*key || !strcmp(key, "}")) {
+            return game_found;
+        }
+
+        COM_Parse(file_contents);
+
+        if (!strcmp(key, QUAKE_II_STEAM_APP_ID)) {
+            game_found = true;
+        }
+    }
+
+    return game_found;
+}
+
+static bool parse_library_vdf(const char **file_contents, char *out_dir, size_t out_dir_length)
+{
+    char library_path[MAX_OSPATH];
+
+    while (true) {
+        char *key = COM_Parse(file_contents);
+
+        if (!*key || !strcmp(key, "}")) {
+            return false;
+        } else if (!strcmp(key, "path")) {
+            COM_ParseToken(file_contents, library_path, sizeof(library_path), PARSE_FLAG_ESCAPE);
+        } else if (!strcmp(key, "apps")) {
+            if (parse_vdf_apps_list(file_contents)) {
+                Q_strlcat(library_path, "\\steamapps\\common\\Quake 2", sizeof(library_path));
+                Q_strlcpy(out_dir, library_path, out_dir_length);
+                return true;
+            }
+        } else {
+            skip_vdf_value(file_contents);
+        }
+    }
+
+    return false;
+}
+
+static bool parse_vdf_libraryfolders(const char **file_contents, char *out_dir, size_t out_dir_length)
+{
+    // parse library folders VDF
+    if (!COM_ParseExpect(file_contents, "libraryfolders") ||
+        !COM_ParseExpect(file_contents, "{")) {
+        return false;
+    }
+
+    while (true) {
+        char *token = COM_Parse(file_contents);
+
+        // done with folders
+        if (!*token || !strcmp(token, "}")) {
+            break;
+        }
+
+        // should be an integer; check the entrance of the folder
+        if (!COM_ParseExpect(file_contents, "{")) {
+            break;
+        }
+
+        if (parse_library_vdf(file_contents, out_dir, out_dir_length)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static bool find_steam_installation_path(char *out_dir, size_t out_dir_length)
+{
+    // grab Steam installation path
+    DWORD folder_path_len = MAX_OSPATH;
+    char folder_path[MAX_OSPATH];
+    bool result = false;
+    
+#ifndef _WIN64
+    LSTATUS status = RegGetValueA(HKEY_LOCAL_MACHINE, "SOFTWARE\\Valve\\Steam\\", "InstallPath", RRF_RT_REG_SZ, NULL, (PVOID) &folder_path, &folder_path_len);
+#else
+    LSTATUS status = RegGetValueA(HKEY_LOCAL_MACHINE, "SOFTWARE\\WOW6432Node\\Valve\\Steam\\", "InstallPath", RRF_RT_REG_SZ, NULL, (PVOID) &folder_path, &folder_path_len);
+#endif
+
+    if (status != ERROR_SUCCESS) {
+        Com_WPrintf("Error %lu finding Steam installation.\n", GetLastError());
+        return result;
+    }
+
+    // grab library folders file
+    Q_strlcat(folder_path, "\\steamapps\\libraryfolders.vdf", sizeof(folder_path));
+
+    FILE *libraryfolders = fopen(folder_path, "rb");
+
+    if (!libraryfolders)
+        return result;
+
+    fseek(libraryfolders, 0, SEEK_END);
+    long len = ftell(libraryfolders);
+    fseek(libraryfolders, 0, SEEK_SET);
+
+    char *file_contents = Z_Malloc(len + 1);
+    file_contents[len] = '\0';
+
+    size_t file_read = fread((void *) file_contents, 1, len, libraryfolders);
+
+    fclose(libraryfolders);
+
+    if (file_read != len) {
+        Com_EPrintf("Error %lu reading libraryfolders.vdf.\n", GetLastError());
+        result = false;
+        goto exit;
+    }
+
+    char *parse_contents = file_contents;
+
+    result = parse_vdf_libraryfolders((const char **) &parse_contents, out_dir, out_dir_length);
+
+    FS_NormalizePath(out_dir);
+
+exit:
+    Z_Free(file_contents);
+    return result;
+}
+
+static bool find_gog_installation_path(const char *app_id, char *out_dir, size_t out_dir_length)
+{
+    DWORD folder_path_len = MAX_OSPATH;
+    char folder_path[MAX_OSPATH];
+    bool result = false;
+    
+#ifndef _WIN64
+    LSTATUS status = RegGetValueA(HKEY_LOCAL_MACHINE, va("SOFTWARE\\GOG.com\\Games\\%s\\", app_id), "path", RRF_RT_REG_SZ, NULL, (PVOID) &folder_path, &folder_path_len);
+#else
+    LSTATUS status = RegGetValueA(HKEY_LOCAL_MACHINE, va("SOFTWARE\\WOW6432Node\\GOG.com\\Games\\%s\\", app_id), "path", RRF_RT_REG_SZ, NULL, (PVOID) &folder_path, &folder_path_len);
+#endif
+
+    if (status != ERROR_SUCCESS) {
+        Com_WPrintf("Error %lu finding GOG installation.\n", GetLastError());
+        return result;
+    }
+
+    Q_strlcpy(out_dir, folder_path, out_dir_length);
+
+    FS_NormalizePath(out_dir);
+
+    return true;
+}
+
+static bool find_xbox_installation_path(PCWSTR family_name, char *out_dir, size_t out_dir_length)
+{
+#ifdef XBOX_SUPPORT
+    if (!IsWindows8Point1OrGreater())
+        return false;
+
+    WCHAR buffer[MAX_PATH];
+    PWSTR packageNames[1];
+    uint32_t num_packages = 1, buffer_length = MAX_PATH;
+    LONG result = GetPackagesByPackageFamily(family_name, &num_packages, packageNames, &buffer_length, buffer);
+
+    if (result)
+        return false;
+
+    WCHAR path[MAX_PATH];
+    uint32_t pathLength = MAX_PATH;
+    result = GetPackagePathByFullName(packageNames[0], &pathLength, path);
+    
+    if (result)
+        return false;
+
+    WideCharToMultiByte(CP_ACP, 0, path, pathLength, out_dir, out_dir_length, NULL, NULL);
+    return true;
+#endif
+
+    return false;
+}
+
+/*
+================
+Sys_GetInstalledGamePath
+================
+*/
+bool Sys_GetInstalledGamePath(game_path_t path_type, char *path, size_t path_length)
+{
+    Q_strlcpy(path, "", path_length);
+    
+    if (path_type == GAME_PATH_STEAM) {
+        return find_steam_installation_path(path, path_length);
+    } else if (path_type == GAME_PATH_GOG_RERELEASE) {
+        return find_gog_installation_path(QUAKE_II_GOG_RERELEASE_APP_ID, path, path_length);
+    } else if (path_type == GAME_PATH_GOG_CLASSIC) {
+        return find_gog_installation_path(QUAKE_II_GOG_CLASSIC_APP_ID, path, path_length);
+    } else if (path_type == GAME_PATH_XBOX_RERELEASE) {
+        return find_xbox_installation_path(QUAKE_II_XBOX_FAMILY_NAME, path, path_length);
+    }
+
+    return false;
 }
 
 /*

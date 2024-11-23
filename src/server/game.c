@@ -18,9 +18,19 @@ with this program; if not, write to the Free Software Foundation, Inc.,
 // sv_game.c -- interface to the game dll
 
 #include "server.h"
+#include "game3_proxy/game3_proxy.h"
+#include "common/loc.h"
+#include "common/gamedll.h"
+
+#if USE_CLIENT
+#include "client/video.h"
+#endif
+
+#include "server/nav.h"
 
 const game_export_t     *ge;
-const game_export_ex_t  *gex;
+const game_q2pro_restart_filesystem_t *g_restart_fs;
+const game_q2pro_customize_entity_t   *g_customize_entity;
 
 static void PF_configstring(int index, const char *val);
 
@@ -87,7 +97,7 @@ Sends the contents of the mutlicast buffer to a single client.
 Archived in MVD stream.
 ===============
 */
-static void PF_Unicast(edict_t *ent, qboolean reliable)
+static void PF_Unicast(edict_t *ent, bool reliable, uint32_t dupe_key)
 {
     client_t    *client;
     int         cmd, flags, clientNum;
@@ -96,15 +106,18 @@ static void PF_Unicast(edict_t *ent, qboolean reliable)
         goto clear;
     }
 
+    if (msg_write.overflowed)
+        Com_Error(ERR_DROP, "%s: message buffer overflowed", __func__);
+
     clientNum = NUM_FOR_EDICT(ent) - 1;
     if (clientNum < 0 || clientNum >= sv_maxclients->integer) {
-        Com_WPrintf("%s to a non-client %d\n", __func__, clientNum);
+        Com_DWPrintf("%s to a non-client %d\n", __func__, clientNum);
         goto clear;
     }
 
     client = svs.client_pool + clientNum;
     if (client->state <= cs_zombie) {
-        Com_WPrintf("%s to a free/zombie client %d\n", __func__, clientNum);
+        Com_DWPrintf("%s to a free/zombie client %d\n", __func__, clientNum);
         goto clear;
     }
 
@@ -146,28 +159,26 @@ Sends text to all active clients.
 Archived in MVD stream.
 =================
 */
-static void PF_bprintf(int level, const char *fmt, ...)
+static void PF_Broadcast_Print(int level, const char *msg)
 {
-    va_list     argptr;
     char        string[MAX_STRING_CHARS];
     client_t    *client;
     size_t      len;
     int         i;
 
-    va_start(argptr, fmt);
-    len = Q_vsnprintf(string, sizeof(string), fmt, argptr);
-    va_end(argptr);
-
+    len = Q_strlcpy(string, msg, sizeof(string));
     if (len >= sizeof(string)) {
-        Com_WPrintf("%s: overflow\n", __func__);
+        Com_DWPrintf("%s: overflow\n", __func__);
         return;
     }
 
     SV_MvdBroadcastPrint(level, string);
 
-    MSG_WriteByte(svc_print);
-    MSG_WriteByte(level);
-    MSG_WriteData(string, len + 1);
+    q2proto_svc_message_t message = {.type = Q2P_SVC_PRINT, .print = {0}};
+    message.print.level = level;
+    message.print.string.str = string;
+    message.print.string.len = len;
+    q2proto_server_multicast_write(Q2P_PROTOCOL_MULTICAST_FLOAT, Q2PROTO_IOARG_SERVER_WRITE_MULTICAST, &message);
 
     // echo to console
     if (COM_DEDICATED) {
@@ -195,23 +206,8 @@ PF_dprintf
 Debug print to server console.
 ===============
 */
-static void PF_dprintf(const char *fmt, ...)
+static void PF_Com_Print(const char *msg)
 {
-    char        msg[MAXPRINTMSG];
-    va_list     argptr;
-
-#if USE_SAVEGAMES
-    // detect YQ2 game lib by unique first two messages
-    if (!sv.gamedetecthack)
-        sv.gamedetecthack = 1 + !strcmp(fmt, "Game is starting up.\n");
-    else if (sv.gamedetecthack == 2)
-        sv.gamedetecthack = 3 + !strcmp(fmt, "Game is %s built on %s.\n");
-#endif
-
-    va_start(argptr, fmt);
-    Q_vsnprintf(msg, sizeof(msg), fmt, argptr);
-    va_end(argptr);
-
     Con_SkipNotify(true);
     Com_Printf("%s", msg);
     Con_SkipNotify(false);
@@ -225,22 +221,10 @@ Print to a single client if the level passes.
 Archived in MVD stream.
 ===============
 */
-static void PF_cprintf(edict_t *ent, int level, const char *fmt, ...)
+static void PF_Client_Print(edict_t *ent, int level, const char *msg)
 {
-    char        msg[MAX_STRING_CHARS];
-    va_list     argptr;
     int         clientNum;
-    size_t      len;
     client_t    *client;
-
-    va_start(argptr, fmt);
-    len = Q_vsnprintf(msg, sizeof(msg), fmt, argptr);
-    va_end(argptr);
-
-    if (len >= sizeof(msg)) {
-        Com_WPrintf("%s: overflow\n", __func__);
-        return;
-    }
 
     if (!ent) {
         Com_LPrintf(level == PRINT_CHAT ? PRINT_TALK : PRINT_ALL, "%s", msg);
@@ -249,18 +233,20 @@ static void PF_cprintf(edict_t *ent, int level, const char *fmt, ...)
 
     clientNum = NUM_FOR_EDICT(ent) - 1;
     if (clientNum < 0 || clientNum >= sv_maxclients->integer) {
-        Com_Error(ERR_DROP, "%s to a non-client %d", __func__, clientNum);
+        Com_DWPrintf("%s to a non-client %d\n", __func__, clientNum);
+        return;
     }
 
     client = svs.client_pool + clientNum;
     if (client->state <= cs_zombie) {
-        Com_WPrintf("%s to a free/zombie client %d\n", __func__, clientNum);
+        Com_DWPrintf("%s to a free/zombie client %d\n", __func__, clientNum);
         return;
     }
 
-    MSG_WriteByte(svc_print);
-    MSG_WriteByte(level);
-    MSG_WriteData(msg, len + 1);
+    q2proto_svc_message_t message = {.type = Q2P_SVC_PRINT, .print = {0}};
+    message.print.level = level;
+    message.print.string = q2proto_make_string(msg);
+    q2proto_server_write(&client->q2proto_ctx, (uintptr_t)&client->io_data, &message);
 
     if (level >= client->messagelevel) {
         SV_ClientAddMessage(client, MSG_RELIABLE);
@@ -279,12 +265,9 @@ Centerprint to a single client.
 Archived in MVD stream.
 ===============
 */
-static void PF_centerprintf(edict_t *ent, const char *fmt, ...)
+static void PF_Center_Print(edict_t *ent, const char *msg)
 {
-    char        msg[MAX_STRING_CHARS];
-    va_list     argptr;
     int         n;
-    size_t      len;
 
     if (!ent) {
         return;
@@ -292,23 +275,21 @@ static void PF_centerprintf(edict_t *ent, const char *fmt, ...)
 
     n = NUM_FOR_EDICT(ent);
     if (n < 1 || n > sv_maxclients->integer) {
-        Com_WPrintf("%s to a non-client %d\n", __func__, n - 1);
+        Com_DWPrintf("%s to a non-client %d\n", __func__, n - 1);
         return;
     }
 
-    va_start(argptr, fmt);
-    len = Q_vsnprintf(msg, sizeof(msg), fmt, argptr);
-    va_end(argptr);
-
-    if (len >= sizeof(msg)) {
-        Com_WPrintf("%s: overflow\n", __func__);
+    client_t* client = svs.client_pool + n - 1;
+    if (client->state <= cs_zombie) {
+        Com_DWPrintf("%s to a free/zombie client %d\n", __func__, n - 1);
         return;
     }
 
-    MSG_WriteByte(svc_centerprint);
-    MSG_WriteData(msg, len + 1);
+    q2proto_svc_message_t message = {.type = Q2P_SVC_CENTERPRINT, .centerprint = {{0}}};
+    message.centerprint.message = q2proto_make_string(msg);
+    q2proto_server_write(&client->q2proto_ctx, (uintptr_t)&client->io_data, &message);
 
-    PF_Unicast(ent, true);
+    PF_Unicast(ent, true, 0);
 }
 
 /*
@@ -318,16 +299,14 @@ PF_error
 Abort the server with a game error
 ===============
 */
-static q_noreturn void PF_error(const char *fmt, ...)
+static q_noreturn void PF_error(const char *msg)
 {
-    char        msg[MAXERRORMSG];
-    va_list     argptr;
-
-    va_start(argptr, fmt);
-    Q_vsnprintf(msg, sizeof(msg), fmt, argptr);
-    va_end(argptr);
-
     Com_Error(ERR_DROP, "Game Error: %s", msg);
+}
+
+static trace_t PF_Clip(edict_t *entity, const vec3_t start, const vec3_t mins, const vec3_t maxs, const vec3_t end, contents_t contentmask)
+{
+    return SV_Clip(start, mins, maxs, end, entity, contentmask);
 }
 
 /*
@@ -339,8 +318,6 @@ Also sets mins and maxs for inline bmodels
 */
 static void PF_setmodel(edict_t *ent, const char *name)
 {
-    mmodel_t    *mod;
-
     if (!ent || !name)
         Com_Error(ERR_DROP, "PF_setmodel: NULL");
 
@@ -348,7 +325,7 @@ static void PF_setmodel(edict_t *ent, const char *name)
 
 // if it is an inline model, get the size information for it
     if (name[0] == '*') {
-        mod = CM_InlineModel(&sv.cm, name);
+        const mmodel_t *mod = CM_InlineModel(&sv.cm, name);
         VectorCopy(mod->mins, ent->mins);
         VectorCopy(mod->maxs, ent->maxs);
         PF_LinkEdict(ent);
@@ -373,7 +350,7 @@ static void PF_configstring(int index, const char *val)
         Com_Error(ERR_DROP, "%s: bad index: %d", __func__, index);
 
     if (sv.state == ss_dead) {
-        Com_WPrintf("%s: not yet initialized\n", __func__);
+        Com_DWPrintf("%s: not yet initialized\n", __func__);
         return;
     }
 
@@ -382,7 +359,7 @@ static void PF_configstring(int index, const char *val)
 
     // error out entirely if it exceedes array bounds
     len = strlen(val);
-    maxlen = (svs.csr.end - index) * MAX_QPATH;
+    maxlen = (svs.csr.end - index) * CS_MAX_STRING_LENGTH;
     if (len >= maxlen) {
         Com_Error(ERR_DROP,
                   "%s: index %d overflowed: %zu > %zu",
@@ -390,9 +367,9 @@ static void PF_configstring(int index, const char *val)
     }
 
     // print a warning and truncate everything else
-    maxlen = CS_SIZE(&svs.csr, index);
+    maxlen = Com_ConfigstringSize(&svs.csr, index);
     if (len >= maxlen) {
-        Com_WPrintf(
+        Com_DWPrintf(
             "%s: index %d overflowed: %zu > %zu\n",
             __func__, index, len, maxlen - 1);
         len = maxlen - 1;
@@ -414,10 +391,11 @@ static void PF_configstring(int index, const char *val)
     SV_MvdConfigstring(index, val, len);
 
     // send the update to everyone
-    MSG_WriteByte(svc_configstring);
-    MSG_WriteShort(index);
-    MSG_WriteData(val, len);
-    MSG_WriteByte(0);
+    q2proto_svc_message_t message = {.type = Q2P_SVC_CONFIGSTRING, .configstring = {0}};
+    message.configstring.index = index;
+    message.configstring.value.str = val;
+    message.configstring.value.len = len;
+    q2proto_server_multicast_write(Q2P_PROTOCOL_MULTICAST_FLOAT, Q2PROTO_IOARG_SERVER_WRITE_MULTICAST, &message);
 
     FOR_EACH_CLIENT(client) {
         if (client->state < cs_primed) {
@@ -439,12 +417,23 @@ static const char *PF_GetConfigstring(int index)
 
 static void PF_WriteFloat(float f)
 {
-    Com_Error(ERR_DROP, "PF_WriteFloat not implemented");
+    MSG_WriteFloat(f);
+}
+
+typedef enum {
+    VIS_PVS     = 0,
+    VIS_PHS     = 1,
+    VIS_NOAREAS = 2     // can be OR'ed with one of above
+} vis_t;
+
+static void PF_WritePos(const vec3_t pos)
+{
+    q2proto_server_write_pos(Q2P_PROTOCOL_MULTICAST_FLOAT, Q2PROTO_IOARG_SERVER_WRITE_MULTICAST, pos);
 }
 
 static qboolean PF_inVIS(const vec3_t p1, const vec3_t p2, vis_t vis)
 {
-    mleaf_t *leaf1, *leaf2;
+    const mleaf_t *leaf1, *leaf2;
     byte mask[VIS_MAX_BYTES];
 
     leaf1 = CM_PointLeaf(&sv.cm, p1);
@@ -455,10 +444,13 @@ static qboolean PF_inVIS(const vec3_t p1, const vec3_t p2, vis_t vis)
         return false;
     if (!Q_IsBitSet(mask, leaf2->cluster))
         return false;
-    if (!(vis & VIS_NOAREAS) && !CM_AreasConnected(&sv.cm, leaf1->area, leaf2->area))
+    if (vis & VIS_NOAREAS)
+        return true;
+    if (!CM_AreasConnected(&sv.cm, leaf1->area, leaf2->area))
         return false;       // a door blocks it
     return true;
 }
+
 
 /*
 =================
@@ -467,9 +459,9 @@ PF_inPVS
 Also checks portalareas so that doors block sight
 =================
 */
-static qboolean PF_inPVS(const vec3_t p1, const vec3_t p2)
+static qboolean PF_inPVS(const vec3_t p1, const vec3_t p2, bool portals)
 {
-    return PF_inVIS(p1, p2, VIS_PVS);
+    return PF_inVIS(p1, p2, VIS_PVS | (portals ? 0 : VIS_NOAREAS));
 }
 
 /*
@@ -479,9 +471,9 @@ PF_inPHS
 Also checks portalareas so that doors block sound
 =================
 */
-static qboolean PF_inPHS(const vec3_t p1, const vec3_t p2)
+static qboolean PF_inPHS(const vec3_t p1, const vec3_t p2, bool portals)
 {
-    return PF_inVIS(p1, p2, VIS_PHS);
+    return PF_inVIS(p1, p2, VIS_PHS | (portals ? 0 : VIS_NOAREAS));
 }
 
 /*
@@ -511,14 +503,14 @@ or the midpoint of the entity box for bmodels.
 ==================
 */
 static void SV_StartSound(const vec3_t origin, edict_t *edict,
-                          int channel, int soundindex, float volume,
+                          soundchan_t channel, int soundindex, float volume,
                           float attenuation, float timeofs)
 {
-    int         i, ent, vol, att, ofs, flags, sendchan;
     vec3_t      origin_v;
     client_t    *client;
     byte        mask[VIS_MAX_BYTES];
-    mleaf_t     *leaf1, *leaf2;
+    const mleaf_t       *leaf1, *leaf2;
+    q2proto_sound_t snd = {0};
     message_packet_t    *msg;
     bool        force_pos;
 
@@ -532,25 +524,6 @@ static void SV_StartSound(const vec3_t origin, edict_t *edict,
         Com_Error(ERR_DROP, "%s: timeofs = %f", __func__, timeofs);
     if (soundindex < 0 || soundindex >= svs.csr.max_sounds)
         Com_Error(ERR_DROP, "%s: soundindex = %d", __func__, soundindex);
-
-    vol = volume * 255;
-    att = min(attenuation * 64, 255);   // need to clip due to check above
-    ofs = timeofs * 1000;
-
-    ent = NUM_FOR_EDICT(edict);
-
-    sendchan = (ent << 3) | (channel & 7);
-
-    // always send the entity number for channel overrides
-    flags = SND_ENT;
-    if (vol != 255)
-        flags |= SND_VOLUME;
-    if (att != 64)
-        flags |= SND_ATTENUATION;
-    if (ofs)
-        flags |= SND_OFFSET;
-    if (soundindex > 255)
-        flags |= SND_INDEX16;
 
     // send origin for invisible entities
     // the origin can also be explicitly set
@@ -567,23 +540,22 @@ static void SV_StartSound(const vec3_t origin, edict_t *edict,
         }
     }
 
+    snd.index = soundindex;
+    // always send the entity number for channel overrides
+    snd.has_entity_channel = true;
+    snd.entity = NUM_FOR_EDICT(edict);
+    snd.channel = channel;
+    snd.has_position = true;
+    VectorCopy(origin, snd.pos);
+    snd.volume = volume;
+    snd.attenuation = attenuation;
+    snd.timeofs = timeofs;
+
     // prepare multicast message
-    MSG_WriteByte(svc_sound);
-    MSG_WriteByte(flags | SND_POS);
-    if (flags & SND_INDEX16)
-        MSG_WriteShort(soundindex);
-    else
-        MSG_WriteByte(soundindex);
+    q2proto_svc_message_t sound_msg = {.type = Q2P_SVC_SOUND, .sound = {0}};
+    q2proto_sound_encode_message(&snd, &sound_msg.sound);
 
-    if (flags & SND_VOLUME)
-        MSG_WriteByte(vol);
-    if (flags & SND_ATTENUATION)
-        MSG_WriteByte(att);
-    if (flags & SND_OFFSET)
-        MSG_WriteByte(ofs);
-
-    MSG_WriteShort(sendchan);
-    MSG_WritePos(origin);
+    q2proto_server_multicast_write(Q2P_PROTOCOL_MULTICAST_FLOAT, Q2PROTO_IOARG_SERVER_WRITE_MULTICAST, &sound_msg);
 
     // if the sound doesn't attenuate, send it to everyone
     // (global radio chatter, voiceovers, etc)
@@ -592,19 +564,10 @@ static void SV_StartSound(const vec3_t origin, edict_t *edict,
 
     // multicast if force sending origin
     if (force_pos) {
-        if (channel & CHAN_NO_PHS_ADD) {
-            if (channel & CHAN_RELIABLE) {
-                SV_Multicast(NULL, MULTICAST_ALL_R);
-            } else {
-                SV_Multicast(NULL, MULTICAST_ALL);
-            }
-        } else {
-            if (channel & CHAN_RELIABLE) {
-                SV_Multicast(origin, MULTICAST_PHS_R);
-            } else {
-                SV_Multicast(origin, MULTICAST_PHS);
-            }
-        }
+        multicast_t to = MULTICAST_PHS;
+        if (channel & CHAN_NO_PHS_ADD)
+            to = MULTICAST_ALL;
+        SV_Multicast(origin, to, channel & CHAN_RELIABLE);
         return;
     }
 
@@ -639,12 +602,6 @@ static void SV_StartSound(const vec3_t origin, edict_t *edict,
             continue;
         }
 
-        // default client doesn't know that bmodels have weird origins
-        if (edict->solid == SOLID_BSP && client->protocol == PROTOCOL_VERSION_DEFAULT) {
-            SV_ClientAddMessage(client, 0);
-            continue;
-        }
-
         if (LIST_EMPTY(&client->msg_free_list)) {
             Com_WPrintf("%s: %s: out of message slots\n",
                         __func__, client->name);
@@ -653,29 +610,22 @@ static void SV_StartSound(const vec3_t origin, edict_t *edict,
 
         msg = LIST_FIRST(message_packet_t, &client->msg_free_list, entry);
 
-        msg->cursize = 0;
-        msg->flags = flags;
-        msg->index = soundindex;
-        msg->volume = vol;
-        msg->attenuation = att;
-        msg->timeofs = ofs;
-        msg->sendchan = sendchan;
-        for (i = 0; i < 3; i++) {
-            msg->pos[i] = COORD2SHORT(origin[i]);
-        }
+        msg->cursize = SOUND_PACKET;
+        msg->sound = sound_msg.sound;
+        msg->sound.flags &= ~SND_POS; // SND_POS, will be set, if necessary, by emit_snd()
 
         List_Remove(&msg->entry);
         List_Append(&client->msg_unreliable_list, &msg->entry);
-        client->msg_unreliable_bytes += MAX_SOUND_PACKET;
+        client->msg_unreliable_bytes += msg_write.cursize;
     }
 
     // clear multicast buffer
     SZ_Clear(&msg_write);
 
-    SV_MvdStartSound(ent, channel, flags, soundindex, vol, att, ofs);
+    SV_MvdStartSound(snd.entity, channel, sound_msg.sound.flags, soundindex, sound_msg.sound.volume, sound_msg.sound.attenuation, sound_msg.sound.timeofs);
 }
 
-static void PF_StartSound(edict_t *entity, int channel,
+static void PF_StartSound(edict_t *entity, soundchan_t channel,
                           int soundindex, float volume,
                           float attenuation, float timeofs)
 {
@@ -684,37 +634,54 @@ static void PF_StartSound(edict_t *entity, int channel,
     SV_StartSound(NULL, entity, channel, soundindex, volume, attenuation, timeofs);
 }
 
-// TODO: support origin/entity/volume/attenuation/timeofs
+// TODO: support origin; add range checks?
 static void PF_LocalSound(edict_t *target, const vec3_t origin,
-                          edict_t *entity, int channel,
+                          edict_t *entity, soundchan_t channel,
                           int soundindex, float volume,
-                          float attenuation, float timeofs)
+                          float attenuation, float timeofs,
+                          uint32_t dupe_key)
 {
     int entnum = NUM_FOR_EDICT(target);
-    int sendchan = (entnum << 3) | (channel & 7);
-    int flags = SND_ENT;
 
-    if (svs.csr.extended && soundindex > 255)
-        flags |= SND_INDEX16;
+    q2proto_sound_t snd = {.index = soundindex};
+    // always send the entity number for channel overrides
+    snd.has_entity_channel = true;
+    snd.entity = entnum;
+    snd.channel = channel;
+    snd.volume = volume;
+    snd.attenuation = attenuation;
+    snd.timeofs = timeofs;
 
-    MSG_WriteByte(svc_sound);
-    MSG_WriteByte(flags);
-    if (flags & SND_INDEX16)
-        MSG_WriteShort(soundindex);
-    else
-        MSG_WriteByte(soundindex);
-    MSG_WriteShort(sendchan);
+    q2proto_svc_message_t message = {.type = Q2P_SVC_SOUND, .sound = {0}};
+    q2proto_sound_encode_message(&snd, &message.sound);
 
-    PF_Unicast(target, !!(channel & CHAN_RELIABLE));
+    int clientNum = entnum - 1;
+    if (clientNum < 0 || clientNum >= sv_maxclients->integer) {
+        Com_WPrintf("%s to a non-client %d\n", __func__, clientNum);
+        return;
+    }
+
+    client_t *client = svs.client_pool + clientNum;
+    if (client->state <= cs_zombie) {
+        Com_WPrintf("%s to a free/zombie client %d\n", __func__, clientNum);
+        return;
+    }
+
+    q2proto_server_write(&client->q2proto_ctx, Q2PROTO_IOARG_SERVER_WRITE_MULTICAST, &message);
+
+    PF_Unicast(target, !!(channel & CHAN_RELIABLE), dupe_key);
 }
 
-void PF_Pmove(pmove_t *pm)
+void PF_Pmove(void *pm)
 {
-    if (sv_client) {
-        Pmove(pm, &sv_client->pmp);
-    } else {
-        Pmove(pm, &sv_pmp);
-    }
+    const pmoveParams_t *pmp = sv_client ? &sv_client->pmp : &svs.pmp;
+
+    Pmove(pm, pmp);
+}
+
+static void PF_WriteEntity(const edict_t *entity)
+{
+    MSG_WriteShort(NUM_FOR_EDICT(entity));
 }
 
 static cvar_t *PF_cvar(const char *name, const char *value, int flags)
@@ -727,6 +694,16 @@ static cvar_t *PF_cvar(const char *name, const char *value, int flags)
     return Cvar_Get(name, value, flags | CVAR_GAME);
 }
 
+static const char* PF_Argv(int idx)
+{
+    return Cmd_Argv(idx);
+}
+
+static const char* PF_RawArgs(void)
+{
+    return Cmd_RawArgs();
+}
+
 static void PF_AddCommandString(const char *string)
 {
 #if USE_CLIENT
@@ -736,7 +713,7 @@ static void PF_AddCommandString(const char *string)
     Cbuf_AddText(&cmd_buffer, string);
 }
 
-static void PF_SetAreaPortalState(int portalnum, qboolean open)
+static void PF_SetAreaPortalState(int portalnum, bool open)
 {
     CM_SetAreaPortalState(&sv.cm, portalnum, open);
 }
@@ -746,7 +723,7 @@ static qboolean PF_AreasConnected(int area1, int area2)
     return CM_AreasConnected(&sv.cm, area1, area2);
 }
 
-static void *PF_TagMalloc(unsigned size, unsigned tag)
+static void *PF_TagMalloc(size_t size, int tag)
 {
     if (tag > UINT16_MAX - TAG_MAX) {
         Com_Error(ERR_DROP, "%s: bad tag", __func__);
@@ -754,16 +731,12 @@ static void *PF_TagMalloc(unsigned size, unsigned tag)
     return Z_TagMallocz(size, tag + TAG_MAX);
 }
 
-static void PF_FreeTags(unsigned tag)
+static void PF_FreeTags(int tag)
 {
     if (tag > UINT16_MAX - TAG_MAX) {
         Com_Error(ERR_DROP, "%s: bad tag", __func__);
     }
     Z_FreeTags(tag + TAG_MAX);
-}
-
-static void PF_DebugGraph(float value, int color)
-{
 }
 
 static int PF_LoadFile(const char *path, void **buffer, unsigned flags, unsigned tag)
@@ -774,12 +747,147 @@ static int PF_LoadFile(const char *path, void **buffer, unsigned flags, unsigned
     return FS_LoadFileEx(path, buffer, flags, tag + TAG_MAX);
 }
 
-static void *PF_TagRealloc(void *ptr, size_t size)
+static void *PF_GetExtension(const char *name);
+
+static void PF_Bot_RegisterEdict(const edict_t * edict)
 {
-    if (!ptr && size) {
-        Com_Error(ERR_DROP, "%s: untagged allocation not allowed", __func__);
+    Nav_RegisterEdict(edict);
+}
+
+static void PF_Bot_UnRegisterEdict(const edict_t * edict)
+{
+    Nav_UnRegisterEdict(edict);
+}
+
+static GoalReturnCode PF_Bot_MoveToPoint(const edict_t * bot, const vec3_t point, const float moveTolerance)
+{
+    return GoalReturnCode_Error;
+}
+
+static GoalReturnCode PF_Bot_FollowActor(const edict_t * bot, const edict_t * actor)
+{
+    return GoalReturnCode_Error;
+}
+
+static bool PF_GetPathToGoal(const PathRequest* request, PathInfo* info)
+{
+    nav_path_t path = { 0 };
+    path.request = request;
+
+    PathInfo result = Nav_Path(&path);
+
+    if (info)
+        *info = result;
+
+    return result.returnCode < PathReturnCode_StartPathErrors;
+}
+
+static void PF_Loc_Print(edict_t* ent, int level, const char* base, const char** args, size_t num_args)
+{
+    /* FIXME - actually support localization & perform formatting.
+     * Also, the rerelease game docs call this "The new primary entry point for printing." and
+     * "This function replaces all of the others (except Com_Print).",
+     * suggesting all other print functions should be wrappers of this one. */
+
+    char string[MAX_STRING_CHARS];
+    Loc_Localize(base, true, args, num_args, string, sizeof(string));
+
+    if (level & PRINT_BROADCAST) {
+        int broadcast_level = level & ~(PRINT_BROADCAST | PRINT_NO_NOTIFY);
+        // restrict to print levels support by by svc_print
+        if (broadcast_level > PRINT_CHAT && broadcast_level != PRINT_TTS)
+            broadcast_level = PRINT_CHAT;
+        PF_Broadcast_Print(broadcast_level, string);
+    } else {
+        level &= ~PRINT_NO_NOTIFY; // TODO implement
+        PF_Client_Print(ent, level, string);
     }
-    return Z_Realloc(ptr, size);
+}
+
+#if USE_REF
+#include "refresh/refresh.h"
+
+static void PF_Draw_Line(const vec3_t start, const vec3_t end, const rgba_t* color, const float lifeTime, const bool depthTest)
+{
+    R_AddDebugLine(start, end, *((color_t *) color), lifeTime * 1000, depthTest);
+}
+static void PF_Draw_Point(const vec3_t point, const float size, const rgba_t* color, const float lifeTime, const bool depthTest)
+{
+    R_AddDebugPoint(point, size, *((color_t *) color), lifeTime * 1000, depthTest);
+}
+static void PF_Draw_Circle(const vec3_t origin, const float radius, const rgba_t* color, const float lifeTime, const bool depthTest)
+{
+    R_AddDebugCircle(origin, radius, *((color_t *) color), lifeTime * 1000, depthTest);
+}
+static void PF_Draw_Bounds(const vec3_t mins, const vec3_t maxs, const rgba_t* color, const float lifeTime, const bool depthTest)
+{
+    R_AddDebugBounds(mins, maxs, *((color_t *) color), lifeTime * 1000, depthTest);
+}
+static void PF_Draw_Sphere(const vec3_t origin, const float radius, const rgba_t* color, const float lifeTime, const bool depthTest)
+{
+    R_AddDebugSphere(origin, radius, *((color_t *) color), lifeTime * 1000, depthTest);
+}
+static void PF_Draw_OrientedWorldText(const vec3_t origin, const char * text, const rgba_t* color, const float size, const float lifeTime, const bool depthTest)
+{
+    R_AddDebugText(origin, NULL, text, size, *((color_t *) color), lifeTime * 1000, depthTest);
+}
+static void PF_Draw_StaticWorldText(const vec3_t origin, const vec3_t angles, const char * text, const rgba_t* color, const float size, const float lifeTime, const bool depthTest)
+{
+    R_AddDebugText(origin, angles, text, size, *((color_t *) color), lifeTime * 1000, depthTest);
+}
+static void PF_Draw_Cylinder(const vec3_t origin, const float halfHeight, const float radius, const rgba_t* color, const float lifeTime, const bool depthTest)
+{
+    R_AddDebugCylinder(origin, halfHeight, radius, *((color_t *) color), lifeTime * 1000, depthTest);
+}
+static void PF_Draw_Ray(const vec3_t origin, const vec3_t direction, const float length, const float size, const rgba_t* color, const float lifeTime, const bool depthTest)
+{
+    vec3_t end;
+    VectorMA(origin, length, direction, end);
+    R_AddDebugArrow(origin, end, size, *((color_t *) color), *((color_t *) color), lifeTime * 1000, depthTest);
+}
+static void PF_Draw_Arrow(const vec3_t start, const vec3_t end, const float size, const rgba_t* lineColor, const rgba_t* arrowColor, const float lifeTime, const bool depthTest)
+{
+    R_AddDebugArrow(start, end, size, *((color_t *) lineColor), *((color_t *) arrowColor), lifeTime * 1000, depthTest);
+}
+#else
+static void PF_Draw_Line(const vec3_t start, const vec3_t end, const rgba_t* color, const float lifeTime, const bool depthTest) {}
+static void PF_Draw_Point(const vec3_t point, const float size, const rgba_t* color, const float lifeTime, const bool depthTest) {}
+static void PF_Draw_Circle(const vec3_t origin, const float radius, const rgba_t* color, const float lifeTime, const bool depthTest) {}
+static void PF_Draw_Bounds(const vec3_t mins, const vec3_t maxs, const rgba_t* color, const float lifeTime, const bool depthTest) {}
+static void PF_Draw_Sphere(const vec3_t origin, const float radius, const rgba_t* color, const float lifeTime, const bool depthTest) {}
+static void PF_Draw_OrientedWorldText(const vec3_t origin, const char * text, const rgba_t* color, const float size, const float lifeTime, const bool depthTest) {}
+static void PF_Draw_StaticWorldText(const vec3_t origin, const vec3_t angles, const char * text, const rgba_t* color, const float size, const float lifeTime, const bool depthTest) {}
+static void PF_Draw_Cylinder(const vec3_t origin, const float halfHeight, const float radius, const rgba_t* color, const float lifeTime, const bool depthTest) {}
+static void PF_Draw_Ray(const vec3_t origin, const vec3_t direction, const float length, const float size, const rgba_t* color, const float lifeTime, const bool depthTest) {}
+static void PF_Draw_Arrow(const vec3_t start, const vec3_t end, const float size, const rgba_t* lineColor, const rgba_t* arrowColor, const float lifeTime, const bool depthTest) {}
+#endif
+
+static void PF_ReportMatchDetails_Multicast(bool is_end)
+{
+    /* "This function is solely for platforms that need match result data." -
+     * somewhat unclear...
+     * Anyhow, rerelease game writes some message data prior to calling this,
+     * at least discard that data ... */
+    SZ_Clear(&msg_write);
+}
+
+static uint32_t PF_ServerFrame(void)
+{
+    return sv.framenum;
+}
+
+static void PF_SendToClipboard(const char* text)
+{
+#if USE_CLIENT
+    if(vid->set_clipboard_data)
+        vid->set_clipboard_data(text);
+#endif
+}
+
+static size_t PF_Info_ValueForKey (const char *s, const char *key, char *buffer, size_t buffer_len)
+{
+    char *infostr = Info_ValueForKey(s, key);
+    return Q_strlcpy(buffer, infostr, buffer_len);
 }
 
 //==============================================
@@ -787,29 +895,31 @@ static void *PF_TagRealloc(void *ptr, size_t size)
 static const game_import_t game_import = {
     .multicast = SV_Multicast,
     .unicast = PF_Unicast,
-    .bprintf = PF_bprintf,
-    .dprintf = PF_dprintf,
-    .cprintf = PF_cprintf,
-    .centerprintf = PF_centerprintf,
-    .error = PF_error,
+    .Broadcast_Print = PF_Broadcast_Print,
+    .Com_Print = PF_Com_Print,
+    .Client_Print = PF_Client_Print,
+    .Center_Print = PF_Center_Print,
+    .Com_Error = PF_error,
 
     .linkentity = PF_LinkEdict,
     .unlinkentity = PF_UnlinkEdict,
     .BoxEdicts = SV_AreaEdicts,
     .trace = SV_Trace,
+    .clip = PF_Clip,
     .pointcontents = SV_PointContents,
     .setmodel = PF_setmodel,
     .inPVS = PF_inPVS,
     .inPHS = PF_inPHS,
-    .Pmove = PF_Pmove,
 
     .modelindex = PF_ModelIndex,
     .soundindex = PF_SoundIndex,
     .imageindex = PF_ImageIndex,
 
     .configstring = PF_configstring,
+    .get_configstring = PF_GetConfigstring,
     .sound = PF_StartSound,
     .positioned_sound = SV_StartSound,
+    .local_sound = PF_LocalSound,
 
     .WriteChar = MSG_WriteChar,
     .WriteByte = MSG_WriteByte,
@@ -817,9 +927,10 @@ static const game_import_t game_import = {
     .WriteLong = MSG_WriteLong,
     .WriteFloat = PF_WriteFloat,
     .WriteString = MSG_WriteString,
-    .WritePosition = MSG_WritePos,
+    .WritePosition = PF_WritePos,
     .WriteDir = MSG_WriteDir,
     .WriteAngle = MSG_WriteAngle,
+    .WriteEntity = PF_WriteEntity,
 
     .TagMalloc = PF_TagMalloc,
     .TagFree = Z_Free,
@@ -830,13 +941,39 @@ static const game_import_t game_import = {
     .cvar_forceset = Cvar_Set,
 
     .argc = Cmd_Argc,
-    .argv = Cmd_Argv,
-    .args = Cmd_RawArgs,
+    .argv = PF_Argv,
+    .args = PF_RawArgs,
     .AddCommandString = PF_AddCommandString,
 
-    .DebugGraph = PF_DebugGraph,
+    .DebugGraph = SCR_DebugGraph,
     .SetAreaPortalState = PF_SetAreaPortalState,
     .AreasConnected = PF_AreasConnected,
+    .GetExtension = PF_GetExtension,
+
+    .Bot_RegisterEdict = PF_Bot_RegisterEdict,
+    .Bot_UnRegisterEdict = PF_Bot_UnRegisterEdict,
+    .Bot_MoveToPoint = PF_Bot_MoveToPoint,
+    .Bot_FollowActor = PF_Bot_FollowActor,
+    .GetPathToGoal = PF_GetPathToGoal,
+
+    .Loc_Print = PF_Loc_Print,
+    .Draw_Line = PF_Draw_Line,
+    .Draw_Point = PF_Draw_Point,
+    .Draw_Circle = PF_Draw_Circle,
+    .Draw_Bounds = PF_Draw_Bounds,
+    .Draw_Sphere = PF_Draw_Sphere,
+    .Draw_OrientedWorldText = PF_Draw_OrientedWorldText,
+    .Draw_StaticWorldText = PF_Draw_StaticWorldText,
+    .Draw_Cylinder = PF_Draw_Cylinder,
+    .Draw_Ray = PF_Draw_Ray,
+    .Draw_Arrow = PF_Draw_Arrow,
+    .ReportMatchDetails_Multicast = PF_ReportMatchDetails_Multicast,
+    .ServerFrame = PF_ServerFrame,
+    .SendToClipBoard = PF_SendToClipboard,
+
+    .Info_ValueForKey = PF_Info_ValueForKey,
+    .Info_RemoveKey = Info_RemoveKey,
+    .Info_SetValueForKey = Info_SetValueForKey,
 };
 
 static const filesystem_api_v1_t filesystem_api_v1 = {
@@ -857,27 +994,37 @@ static const filesystem_api_v1_t filesystem_api_v1 = {
     .ErrorString = Q_ErrorString,
 };
 
+#if USE_REF && USE_DEBUG
+static const debug_draw_api_v1_t debug_draw_api_v1 = {
+    .ClearDebugLines = R_ClearDebugLines,
+    .AddDebugLine = R_AddDebugLine,
+    .AddDebugPoint = R_AddDebugPoint,
+    .AddDebugAxis = R_AddDebugAxis,
+    .AddDebugBounds = R_AddDebugBounds,
+    .AddDebugSphere = R_AddDebugSphere,
+    .AddDebugCircle = R_AddDebugCircle,
+    .AddDebugCylinder = R_AddDebugCylinder,
+    .AddDebugArrow = R_AddDebugArrow,
+    .AddDebugCurveArrow = R_AddDebugCurveArrow,
+    .AddDebugText = R_AddDebugText,
+};
+#endif
+
 static void *PF_GetExtension(const char *name)
 {
     if (!name)
         return NULL;
-    if (!strcmp(name, "FILESYSTEM_API_V1"))
+
+    if (!strcmp(name, FILESYSTEM_API_V1))
         return (void *)&filesystem_api_v1;
+
+#if USE_REF && USE_DEBUG
+    if (!strcmp(name, DEBUG_DRAW_API_V1) && !dedicated->integer)
+        return (void *)&debug_draw_api_v1;
+#endif
+
     return NULL;
 }
-
-static const game_import_ex_t game_import_ex = {
-    .apiversion = GAME_API_VERSION_EX,
-    .structsize = sizeof(game_import_ex),
-
-    .local_sound = PF_LocalSound,
-    .get_configstring = PF_GetConfigstring,
-    .clip = SV_Clip,
-    .inVIS = PF_inVIS,
-
-    .GetExtension = PF_GetExtension,
-    .TagRealloc = PF_TagRealloc,
-};
 
 static void *game_library;
 
@@ -891,7 +1038,7 @@ it is changing to a different game directory.
 */
 void SV_ShutdownGameProgs(void)
 {
-    gex = NULL;
+    g_restart_fs = NULL;
     if (ge) {
         ge->Shutdown();
         ge = NULL;
@@ -903,38 +1050,6 @@ void SV_ShutdownGameProgs(void)
     Cvar_Set("g_features", "0");
 
     Z_LeakTest(TAG_FREE);
-}
-
-static void *SV_LoadGameLibraryFrom(const char *path)
-{
-    void *entry;
-
-    entry = Sys_LoadLibrary(path, "GetGameAPI", &game_library);
-    if (!entry)
-        Com_EPrintf("Failed to load game library: %s\n", Com_GetLastError());
-    else
-        Com_Printf("Loaded game library from %s\n", path);
-
-    return entry;
-}
-
-static void *SV_LoadGameLibrary(const char *libdir, const char *gamedir)
-{
-    char path[MAX_OSPATH];
-
-    if (Q_concat(path, sizeof(path), libdir,
-                 PATH_SEP_STRING, gamedir, PATH_SEP_STRING,
-                 "game" CPUSTRING LIBSUFFIX) >= sizeof(path)) {
-        Com_EPrintf("Game library path length exceeded\n");
-        return NULL;
-    }
-
-    if (os_access(path, X_OK)) {
-        Com_Printf("Can't access %s: %s\n", path, strerror(errno));
-        return NULL;
-    }
-
-    return SV_LoadGameLibraryFrom(path);
 }
 
 /*
@@ -952,58 +1067,66 @@ void SV_InitGameProgs(void)
     // unload anything we have now
     SV_ShutdownGameProgs();
 
-    // for debugging or `proxy' mods
-    if (sys_forcegamelib->string[0])
-        entry = SV_LoadGameLibraryFrom(sys_forcegamelib->string);
-
-    // try game first
-    if (!entry && fs_game->string[0]) {
-        if (sys_homedir->string[0])
-            entry = SV_LoadGameLibrary(sys_homedir->string, fs_game->string);
-        if (!entry)
-            entry = SV_LoadGameLibrary(sys_libdir->string, fs_game->string);
-    }
-
-    // then try baseq2
-    if (!entry) {
-        if (sys_homedir->string[0])
-            entry = SV_LoadGameLibrary(sys_homedir->string, BASEGAME);
-        if (!entry)
-            entry = SV_LoadGameLibrary(sys_libdir->string, BASEGAME);
-    }
-
-    // all paths failed
+    game_library = GameDll_Load();
+    if (game_library)
+        entry = Sys_GetProcAddress(game_library, "GetGameAPI");
     if (!entry)
         Com_Error(ERR_DROP, "Failed to load game library");
 
     // load a new game dll
     import = game_import;
+    import.tick_rate = SV_FRAMERATE;
+    import.frame_time_s = SV_FRAMETIME * 0.001f;
+    import.frame_time_ms = SV_FRAMETIME;
 
     ge = entry(&import);
     if (!ge) {
         Com_Error(ERR_DROP, "Game library returned NULL exports");
     }
 
-    if (ge->apiversion != GAME_API_VERSION) {
-        Com_Error(ERR_DROP, "Game library is version %d, expected %d",
-                  ge->apiversion, GAME_API_VERSION);
-    }
+    Com_DPrintf("Game API version: %d\n", ge->apiversion);
 
     // get extended api if present
-    game_entry_ex_t entry_ex = Sys_GetProcAddress(game_library, "GetGameAPIEx");
-    if (entry_ex)
-        gex = entry_ex(&game_import_ex);
+    void* entry_ex = Sys_GetProcAddress(game_library, "GetGameAPIEx");
+
+    if (ge->apiversion != GAME_API_VERSION) {
+        if (ge->apiversion == GAME3_API_VERSION_OLD || ge->apiversion == GAME3_API_VERSION_NEW) {
+            Com_DPrintf("... using proxy game\n");
+            if (ge->apiversion == GAME3_API_VERSION_NEW)
+                svs.game_type = Q2PROTO_GAME_Q2PRO_EXTENDED_V2;
+            else
+                svs.game_type = Q2PROTO_GAME_VANILLA; // may also be Q2PROTO_GAME_Q2PRO_EXTENDED, we'll know after checking g_features
+            ge = GetGame3Proxy(&import, entry, entry_ex);
+        } else {
+            Com_Error(ERR_DROP, "...but expected %d\n", GAME_API_VERSION);
+        }
+    } else {
+        svs.game_type = Q2PROTO_GAME_RERELEASE;
+        Cvar_SetInteger(g_features, GMF_PROTOCOL_EXTENSIONS | GMF_ENHANCED_SAVEGAMES | GMF_PROPERINUSE | GMF_WANT_ALL_DISCONNECTS, FROM_CODE);
+    }
 
     // initialize
+    /* Note: Those functions may already call configstring(). They also decide the features...
+     * So start with an extended csr, and possible choose a smaller one later. */
+    if (svs.game_type == Q2PROTO_GAME_RERELEASE)
+        svs.csr = cs_remap_rerelease;
+    else
+        svs.csr = cs_remap_q2pro_new;
+    ge->PreInit(); // FIXME: When to call PreInit(), when Init()?
     ge->Init();
 
-    if (g_features->integer & GMF_PROTOCOL_EXTENSIONS) {
-        Com_Printf("Game supports Q2PRO protocol extensions.\n");
-        svs.csr = cs_remap_new;
+    g_restart_fs = (game_q2pro_restart_filesystem_t *)ge->GetExtension(game_q2pro_restart_filesystem_ext);
+    g_customize_entity = (game_q2pro_customize_entity_t *)ge->GetExtension(game_q2pro_customize_entity_ext);
+
+    if (svs.game_type == Q2PROTO_GAME_VANILLA) {
+        if ((g_features->integer & GMF_PROTOCOL_EXTENSIONS) != 0)
+            svs.game_type = Q2PROTO_GAME_Q2PRO_EXTENDED;
+        else
+            svs.csr = cs_remap_old;
     }
 
     // sanitize edict_size
-    unsigned min_size = svs.csr.extended ? sizeof(edict_t) : q_offsetof(edict_t, x);
+    unsigned min_size = sizeof(edict_t);
     unsigned max_size = INT_MAX / svs.csr.max_edicts;
 
     if (ge->edict_size < min_size || ge->edict_size > max_size || ge->edict_size % q_alignof(edict_t)) {
@@ -1014,4 +1137,7 @@ void SV_InitGameProgs(void)
     if (ge->max_edicts <= sv_maxclients->integer || ge->max_edicts > svs.csr.max_edicts) {
         Com_Error(ERR_DROP, "Game library returned bad number of max_edicts");
     }
+
+    svs.server_info.game_type = svs.game_type;
+    svs.server_info.default_packet_length = MAX_PACKETLEN_WRITABLE_DEFAULT;
 }

@@ -22,11 +22,13 @@ with this program; if not, write to the Free Software Foundation, Inc.,
 #include "common/error.h"
 #include "common/zone.h"
 #include "shared/files.h"
+#include "common/natsort.h"
 
 #define MIN_LISTED_FILES    1024
 #define MAX_LISTED_FILES    250000000
 #define MAX_LISTED_DEPTH    8
 
+// prevents integer overflows
 #define MAX_LOADFILE            0x4001000   // 64 MiB + some slop
 
 #define FS_Malloc(size)         Z_TagMalloc(size, TAG_FILESYSTEM)
@@ -39,9 +41,8 @@ with this program; if not, write to the Free Software Foundation, Inc.,
 #define FS_AllocTempMem(size)   FS_Malloc(size)
 #define FS_FreeTempMem(buf)     Z_Free(buf)
 
-// just regular caseless string comparsion
-#define FS_pathcmp      Q_strcasecmp
-#define FS_pathcmpn     Q_strncasecmp
+#define FS_pathcmp      strnatcasecmp
+#define FS_pathcmpn     strnatcasencmp
 
 #define FS_HashPath(s, size)            Com_HashStringLen(s, SIZE_MAX, size)
 #define FS_HashPathLen(s, len, size)    Com_HashStringLen(s, len, size)
@@ -97,7 +98,7 @@ bool FS_ExtCmp(const char *extension, const char *string);
 const char *FS_NextPath(const char *path);
 
 #define FS_ReallocList(list, count) \
-    Z_Realloc(list, ALIGN(count, MIN_LISTED_FILES) * sizeof(void *))
+    Z_Realloc(list, Q_ALIGN(count, MIN_LISTED_FILES) * sizeof(void *))
 
 void    **FS_ListFiles(const char *path, const char *filter, unsigned flags, int *count_p);
 void    **FS_CopyList(void **list, int count);
@@ -107,11 +108,14 @@ void    FS_FreeList(void **list);
 size_t FS_NormalizePathBuffer(char *out, const char *in, size_t size);
 #define FS_NormalizePath(path)  FS_NormalizePathBuffer(path, path, SIZE_MAX)
 
-#define PATH_INVALID        0
-#define PATH_VALID          1
-#define PATH_MIXED_CASE     2
+typedef enum {
+    PATH_NOT_CHECKED = -1,  // never returned by FS_ValidatePath()
+    PATH_INVALID = 0,
+    PATH_VALID,
+    PATH_MIXED_CASE
+} path_valid_t;
 
-int FS_ValidatePath(const char *s);
+path_valid_t FS_ValidatePath(const char *s);
 void FS_CleanupPath(char *s);
 
 #ifdef _WIN32

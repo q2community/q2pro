@@ -26,14 +26,14 @@ void AngleVectors(const vec3_t angles, vec3_t forward, vec3_t right, vec3_t up)
     float        sr, sp, sy, cr, cp, cy;
 
     angle = DEG2RAD(angles[YAW]);
-    sy = sin(angle);
-    cy = cos(angle);
+    sy = sinf(angle);
+    cy = cosf(angle);
     angle = DEG2RAD(angles[PITCH]);
-    sp = sin(angle);
-    cp = cos(angle);
+    sp = sinf(angle);
+    cp = cosf(angle);
     angle = DEG2RAD(angles[ROLL]);
-    sr = sin(angle);
-    cr = cos(angle);
+    sr = sinf(angle);
+    cr = cosf(angle);
 
     if (forward) {
         forward[0] = cp * cy;
@@ -74,6 +74,21 @@ vec_t VectorNormalize2(const vec3_t v, vec3_t out)
     return VectorNormalize(out);
 }
 
+vec_t Vector2Normalize(vec2_t v)
+{
+    float    length, ilength;
+
+    length = Vector2Length(v);
+
+    if (length) {
+        ilength = 1 / length;
+        v[0] *= ilength;
+        v[1] *= ilength;
+    }
+
+    return length;
+}
+
 void ClearBounds(vec3_t mins, vec3_t maxs)
 {
     mins[0] = mins[1] = mins[2] = 99999;
@@ -100,6 +115,53 @@ void UnionBounds(const vec3_t a[2], const vec3_t b[2], vec3_t c[2])
         c[0][i] = min(a[0][i], b[0][i]);
         c[1][i] = max(a[1][i], b[1][i]);
     }
+}
+
+bool IntersectBounds(const vec3_t amins, const vec3_t amaxs, const vec3_t bmins, const vec3_t bmaxs)
+{
+	return amins[0] <= bmaxs[0] &&
+		   amaxs[0] >= bmins[0] &&
+		   amins[1] <= bmaxs[1] &&
+		   amaxs[1] >= bmins[1] &&
+		   amins[2] <= bmaxs[2] &&
+		   amaxs[2] >= bmins[2];
+}
+
+// adapted from https://github.com/svkaiser/PowerslaveEX/tree/master
+bool IntersectBoundLine(const vec3_t mins, const vec3_t maxs, const vec3_t start, const vec3_t end)
+{
+    vec3_t center;
+    VectorAdd(maxs, mins, center);
+    VectorScale(center, 0.5f, center);
+    vec3_t extents;
+    VectorSubtract(maxs, center, extents);
+    vec3_t lineDir;
+    VectorSubtract(end, start, lineDir);
+    VectorScale(lineDir, 0.5f, lineDir);
+    vec3_t lineCenter;
+    VectorAdd(lineDir, start, lineCenter);
+    vec3_t dir;
+    VectorSubtract(lineCenter, center, dir);
+    
+    vec3_t ld;
+
+    for (int i = 0; i < 3; i++) {
+        ld[i] = fabsf(lineDir[i]);
+        if (fabsf(dir[i]) > extents[i] + ld[i])
+            return false;
+    }
+
+    vec3_t cross;
+    CrossProduct(lineDir, dir, cross);
+
+    if (fabsf(cross[0]) > extents[1] * ld[2] + extents[2] * ld[1])
+        return false;
+    if (fabsf(cross[1]) > extents[0] * ld[2] + extents[2] * ld[0])
+        return false;
+    if (fabsf(cross[2]) > extents[0] * ld[1] + extents[1] * ld[0])
+        return false;
+
+    return true;
 }
 
 /*
@@ -413,8 +475,29 @@ char *vtos(const vec3_t v)
     return str[index];
 }
 
-static char     com_token[4][MAX_TOKEN_CHARS];
-static int      com_tokidx;
+unsigned com_linenum;
+
+/*
+=============
+COM_ParseEscapeSequence
+=============
+*/
+static bool COM_ParseEscapeSequence(const char **data_p, int *c)
+{
+    *c = *(*data_p)++;
+
+    if (*c == 'n') {
+        *c = '\n';
+    } else if (*c == 't') {
+        *c = '\t';
+    } else if (*c == 'r') {
+        *c = '\r';
+    } else if (*c == '\0') {
+        return false;
+    }
+
+    return true;
+}
 
 /*
 ==============
@@ -424,22 +507,20 @@ Parse a token out of a string.
 Handles C and C++ comments.
 ==============
 */
-char *COM_Parse(const char **data_p)
+size_t COM_ParseToken(const char **data_p, char *buffer, size_t size, int flags)
 {
     int         c;
-    int         len;
+    size_t      len;
     const char  *data;
-    char        *s = com_token[com_tokidx];
-
-    com_tokidx = (com_tokidx + 1) & 3;
 
     data = *data_p;
     len = 0;
-    s[0] = 0;
+    if (size)
+        *buffer = 0;
 
     if (!data) {
         *data_p = NULL;
-        return s;
+        return len;
     }
 
 // skip whitespace
@@ -447,7 +528,10 @@ skipwhite:
     while ((c = *data) <= ' ') {
         if (c == 0) {
             *data_p = NULL;
-            return s;
+            return len;
+        }
+        if (c == '\n') {
+            com_linenum++;
         }
         data++;
     }
@@ -468,6 +552,9 @@ skipwhite:
                 data += 2;
                 break;
             }
+            if (data[0] == '\n') {
+                com_linenum++;
+            }
             data++;
         }
         goto skipwhite;
@@ -482,25 +569,53 @@ skipwhite:
                 goto finish;
             }
 
-            if (len < MAX_TOKEN_CHARS - 1) {
-                s[len++] = c;
+            if (c == '\\' && (flags & PARSE_FLAG_ESCAPE)) {
+                if (!COM_ParseEscapeSequence(&data, &c)) {
+                    goto finish;
+                }
             }
+            if (c == '\n') {
+                com_linenum++;
+            }
+            if (len + 1 < size) {
+                *buffer++ = c;
+            }
+            len++;
         }
     }
 
 // parse a regular word
     do {
-        if (len < MAX_TOKEN_CHARS - 1) {
-            s[len++] = c;
+        if (c == '\\' && (flags & PARSE_FLAG_ESCAPE)) {
+            if (!COM_ParseEscapeSequence(&data, &c)) {
+                break;
+            }
         }
+
+        if (len + 1 < size) {
+            *buffer++ = c;
+        }
+        len++;
         data++;
         c = *data;
     } while (c > 32);
 
 finish:
-    s[len] = 0;
+    if (size)
+        *buffer = 0;
 
     *data_p = data;
+    return len;
+}
+
+char *COM_ParseEx(const char **data_p, int flags)
+{
+    static char     com_token[4][MAX_TOKEN_CHARS];
+    static int      com_tokidx;
+    char            *s = com_token[com_tokidx];
+
+    COM_ParseToken(data_p, s, sizeof(com_token[0]), flags);
+    com_tokidx = (com_tokidx + 1) & 3;
     return s;
 }
 
@@ -701,6 +816,26 @@ size_t Q_strlcpy(char *dst, const char *src, size_t size)
 
 /*
 ===============
+Q_strnlcpy
+
+Returns `count`.
+===============
+*/
+size_t Q_strnlcpy(char *dst, const char *src, size_t count, size_t size)
+{
+    size_t ret = min(count, strlen(src));
+
+    if (size) {
+        size_t len = min(ret, size - 1);
+        memcpy(dst, src, len);
+        dst[len] = 0;
+    }
+
+    return ret;
+}
+
+/*
+===============
 Q_strlcat
 
 Returns length of the source and destinations strings combined.
@@ -713,6 +848,22 @@ size_t Q_strlcat(char *dst, const char *src, size_t size)
     Q_assert(len < size);
 
     return len + Q_strlcpy(dst + len, src, size - len);
+}
+
+/*
+===============
+Q_strnlcat
+
+Returns length of the source and destinations strings combined.
+===============
+*/
+size_t Q_strnlcat(char *dst, const char *src, size_t count, size_t size)
+{
+    size_t len = strlen(dst);
+
+    Q_assert(len < size);
+
+    return len + Q_strnlcpy(dst + len, src, count, size - len);
 }
 
 /*
@@ -921,8 +1072,8 @@ uint32_t Q_rand(void)
         mt_index = 0;
 
 #define STEP(j, k) do {                 \
-        x  = mt_state[i] & 0x80000000;  \
-        x |= mt_state[j] & 0x7FFFFFFF;  \
+        x  = mt_state[i] & BIT(31);     \
+        x |= mt_state[j] & MASK(31);    \
         y  = x >> 1;                    \
         y ^= 0x9908B0DF & -(x & 1);     \
         mt_state[i] = mt_state[k] ^ y;  \
@@ -1028,8 +1179,9 @@ fail:
 Info_RemoveKey
 ==================
 */
-void Info_RemoveKey(char *s, const char *key)
+bool Info_RemoveKey(char *s, const char *key)
 {
+    bool    found_one = false;
     char    *start;
     char    pkey[MAX_INFO_STRING];
     char    *o;
@@ -1041,7 +1193,7 @@ void Info_RemoveKey(char *s, const char *key)
         o = pkey;
         while (*s != '\\') {
             if (!*s)
-                return;
+                return found_one;
             *o++ = *s++;
         }
         *o = 0;
@@ -1058,13 +1210,15 @@ void Info_RemoveKey(char *s, const char *key)
             }
             *o = 0;
             s = start;
+            found_one = true;
             continue; // search for duplicates
         }
 
         if (!*s)
-            return;
+            return found_one;
     }
 
+    return found_one;
 }
 
 
@@ -1300,8 +1454,6 @@ void Info_Print(const char *infostring)
 =====================================================================
 */
 
-#if USE_PROTOCOL_EXTENSIONS
-
 const cs_remap_t cs_remap_old = {
     .extended    = false,
 
@@ -1309,6 +1461,8 @@ const cs_remap_t cs_remap_old = {
     .max_models  = MAX_MODELS_OLD,
     .max_sounds  = MAX_SOUNDS_OLD,
     .max_images  = MAX_IMAGES_OLD,
+    .max_shadowlights = 0,
+    .max_wheelitems = 0,
 
     .airaccel    = CS_AIRACCEL_OLD,
     .maxclients  = CS_MAXCLIENTS_OLD,
@@ -1318,20 +1472,28 @@ const cs_remap_t cs_remap_old = {
     .sounds      = CS_SOUNDS_OLD,
     .images      = CS_IMAGES_OLD,
     .lights      = CS_LIGHTS_OLD,
+    .shadowlights = -1,
     .items       = CS_ITEMS_OLD,
     .playerskins = CS_PLAYERSKINS_OLD,
     .general     = CS_GENERAL_OLD,
+    .wheelweapons = -1,
+    .wheelammo   = -1,
+    .wheelpowerups = -1,
+    .cdloopcount = -1,
+    .gamestyle   = -1,
 
     .end         = MAX_CONFIGSTRINGS_OLD
 };
 
-const cs_remap_t cs_remap_new = {
+const cs_remap_t cs_remap_rerelease = {
     .extended    = true,
 
     .max_edicts  = MAX_EDICTS,
     .max_models  = MAX_MODELS,
     .max_sounds  = MAX_SOUNDS,
     .max_images  = MAX_IMAGES,
+    .max_shadowlights = MAX_SHADOW_LIGHTS,
+    .max_wheelitems = MAX_WHEEL_ITEMS,
 
     .airaccel    = CS_AIRACCEL,
     .maxclients  = CS_MAXCLIENTS,
@@ -1341,11 +1503,46 @@ const cs_remap_t cs_remap_new = {
     .sounds      = CS_SOUNDS,
     .images      = CS_IMAGES,
     .lights      = CS_LIGHTS,
+    .shadowlights = CS_SHADOWLIGHTS,
     .items       = CS_ITEMS,
     .playerskins = CS_PLAYERSKINS,
     .general     = CS_GENERAL,
+    .wheelweapons = CS_WHEEL_WEAPONS,
+    .wheelammo   = CS_WHEEL_AMMO,
+    .wheelpowerups = CS_WHEEL_POWERUPS,
+    .cdloopcount = CS_CD_LOOP_COUNT,
+    .gamestyle   = CS_GAME_STYLE,
 
     .end         = MAX_CONFIGSTRINGS
 };
 
-#endif
+const cs_remap_t cs_remap_q2pro_new = {
+    .extended    = true,
+
+    .max_edicts  = MAX_EDICTS,
+    .max_models  = MAX_MODELS,
+    .max_sounds  = MAX_SOUNDS,
+    .max_images  = MAX_IMAGES_EX,
+    .max_shadowlights = 0,
+    .max_wheelitems = 0,
+
+    .airaccel    = CS_AIRACCEL_EX,
+    .maxclients  = CS_MAXCLIENTS_EX,
+    .mapchecksum = CS_MAPCHECKSUM_EX,
+
+    .models      = CS_MODELS_EX,
+    .sounds      = CS_SOUNDS_EX,
+    .images      = CS_IMAGES_EX,
+    .lights      = CS_LIGHTS_EX,
+    .shadowlights = -1,
+    .items       = CS_ITEMS_EX,
+    .playerskins = CS_PLAYERSKINS_EX,
+    .general     = CS_GENERAL_EX,
+    .wheelweapons = -1,
+    .wheelammo   = -1,
+    .wheelpowerups = -1,
+    .cdloopcount = -1,
+    .gamestyle   = -1,
+
+    .end         = MAX_CONFIGSTRINGS_EX
+};

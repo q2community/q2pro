@@ -19,6 +19,8 @@ with this program; if not, write to the Free Software Foundation, Inc.,
 
 #include "client.h"
 
+#include "q2proto/q2proto.h"
+
 cvar_t  *rcon_address;
 
 cvar_t  *cl_noskins;
@@ -86,6 +88,7 @@ cvar_t  *cl_vwep;
 cvar_t  *info_password;
 cvar_t  *info_spectator;
 cvar_t  *info_name;
+cvar_t  *info_dogtag;
 cvar_t  *info_skin;
 cvar_t  *info_rate;
 cvar_t  *info_fov;
@@ -99,6 +102,8 @@ extern cvar_t *gl_modulate_world;
 extern cvar_t *gl_modulate_entities;
 extern cvar_t *gl_brightness;
 #endif
+
+static cvar_t   *cl_hit_markers; // 1 = sound + pic, 2 = pic
 
 client_static_t cls;
 client_state_t  cl;
@@ -146,14 +151,10 @@ static request_t *CL_AddRequest(const netadr_t *adr, requestType_t type)
 static request_t *CL_FindRequest(void)
 {
     request_t *r;
-    int i, count;
-
-    count = MAX_REQUESTS;
-    if (count > nextRequest)
-        count = nextRequest;
+    int i;
 
     // find the most recent request sent to this address
-    for (i = 0; i < count; i++) {
+    for (i = 0; i < MAX_REQUESTS; i++) {
         r = &clientRequests[(nextRequest - i - 1) & REQUEST_MASK];
         if (!r->type) {
             continue;
@@ -198,58 +199,64 @@ static void CL_UpdateGunSetting(void)
         nogun = 0;
     }
 
-    MSG_WriteByte(clc_setting);
-    MSG_WriteShort(CLS_NOGUN);
-    MSG_WriteShort(nogun);
+    q2proto_clc_message_t message = {.type = Q2P_CLC_SETTING, .setting = {0}};
+    message.setting.index = CLS_NOGUN;
+    message.setting.value = nogun;
+    q2proto_client_write(&cls.q2proto_ctx, Q2PROTO_IOARG_CLIENT_WRITE, &message);
     MSG_FlushTo(&cls.netchan.message);
 }
 
 static void CL_UpdateGibSetting(void)
 {
-    if (cls.netchan.protocol != PROTOCOL_VERSION_Q2PRO) {
+    if (cls.netchan.protocol != PROTOCOL_VERSION_Q2PRO && cls.serverProtocol != PROTOCOL_VERSION_RERELEASE) {
         return;
     }
 
-    MSG_WriteByte(clc_setting);
-    MSG_WriteShort(CLS_NOGIBS);
-    MSG_WriteShort(!cl_gibs->integer);
+    q2proto_clc_message_t message = {.type = Q2P_CLC_SETTING, .setting = {0}};
+    message.setting.index = CLS_NOGIBS;
+    message.setting.value = !cl_gibs->integer;
+    q2proto_client_write(&cls.q2proto_ctx, Q2PROTO_IOARG_CLIENT_WRITE, &message);
     MSG_FlushTo(&cls.netchan.message);
 }
 
 static void CL_UpdateFootstepsSetting(void)
 {
-    if (cls.netchan.protocol != PROTOCOL_VERSION_Q2PRO) {
+    if (cls.netchan.protocol != PROTOCOL_VERSION_Q2PRO && cls.serverProtocol != PROTOCOL_VERSION_RERELEASE) {
         return;
     }
 
-    MSG_WriteByte(clc_setting);
-    MSG_WriteShort(CLS_NOFOOTSTEPS);
-    MSG_WriteShort(!cl_footsteps->integer);
+    q2proto_clc_message_t message = {.type = Q2P_CLC_SETTING, .setting = {0}};
+    message.setting.index = CLS_NOFOOTSTEPS;
+    message.setting.value = !cl_footsteps->integer;
+    q2proto_client_write(&cls.q2proto_ctx, Q2PROTO_IOARG_CLIENT_WRITE, &message);
     MSG_FlushTo(&cls.netchan.message);
 }
 
 static void CL_UpdatePredictSetting(void)
 {
-    if (cls.netchan.protocol != PROTOCOL_VERSION_Q2PRO) {
+    if (cls.netchan.protocol != PROTOCOL_VERSION_Q2PRO && cls.serverProtocol != PROTOCOL_VERSION_RERELEASE) {
         return;
     }
 
-    MSG_WriteByte(clc_setting);
-    MSG_WriteShort(CLS_NOPREDICT);
-    MSG_WriteShort(!cl_predict->integer);
+    q2proto_clc_message_t message = {.type = Q2P_CLC_SETTING, .setting = {0}};
+    message.setting.index = CLS_NOPREDICT;
+    message.setting.value = !cl_predict->integer;
+    q2proto_client_write(&cls.q2proto_ctx, Q2PROTO_IOARG_CLIENT_WRITE, &message);
     MSG_FlushTo(&cls.netchan.message);
 }
 
 #if USE_FPS
 static void CL_UpdateRateSetting(void)
 {
+    // Rerelease protocol sends framerate in server data
     if (cls.netchan.protocol != PROTOCOL_VERSION_Q2PRO) {
         return;
     }
 
-    MSG_WriteByte(clc_setting);
-    MSG_WriteShort(CLS_FPS);
-    MSG_WriteShort(cl_updaterate->integer);
+    q2proto_clc_message_t message = {.type = Q2P_CLC_SETTING, .setting = {0}};
+    message.setting.index = CLS_FPS;
+    message.setting.value = cl_updaterate->integer;
+    q2proto_client_write(&cls.q2proto_ctx, Q2PROTO_IOARG_CLIENT_WRITE, &message);
     MSG_FlushTo(&cls.netchan.message);
 }
 #endif
@@ -274,24 +281,26 @@ void CL_UpdateRecordingSetting(void)
     }
 #endif
 
-    MSG_WriteByte(clc_setting);
-    MSG_WriteShort(CLS_RECORDING);
-    MSG_WriteShort(rec);
+    q2proto_clc_message_t message = {.type = Q2P_CLC_SETTING, .setting = {0}};
+    message.setting.index = CLS_RECORDING;
+    message.setting.value = rec;
+    q2proto_client_write(&cls.q2proto_ctx, Q2PROTO_IOARG_CLIENT_WRITE, &message);
     MSG_FlushTo(&cls.netchan.message);
 }
 
 static void CL_UpdateFlaresSetting(void)
 {
-    if (cls.netchan.protocol != PROTOCOL_VERSION_Q2PRO) {
+    if (cls.netchan.protocol != PROTOCOL_VERSION_Q2PRO && cls.serverProtocol != PROTOCOL_VERSION_RERELEASE) {
         return;
     }
     if (!cl.csr.extended) {
         return;
     }
 
-    MSG_WriteByte(clc_setting);
-    MSG_WriteShort(CLS_NOFLARES);
-    MSG_WriteShort(!cl_flares->integer);
+    q2proto_clc_message_t message = {.type = Q2P_CLC_SETTING, .setting = {0}};
+    message.setting.index = CLS_NOFLARES;
+    message.setting.value = !cl_flares->integer;
+    q2proto_client_write(&cls.q2proto_ctx, Q2PROTO_IOARG_CLIENT_WRITE, &message);
     MSG_FlushTo(&cls.netchan.message);
 }
 
@@ -308,8 +317,9 @@ void CL_ClientCommand(const char *string)
 
     Com_DDPrintf("%s: %s\n", __func__, string);
 
-    MSG_WriteByte(clc_stringcmd);
-    MSG_WriteString(string);
+    q2proto_clc_message_t message = {.type = Q2P_CLC_STRINGCMD};
+    message.stringcmd.cmd = q2proto_make_string(string);
+    q2proto_client_write(&cls.q2proto_ctx, Q2PROTO_IOARG_CLIENT_WRITE, &message);
     MSG_FlushTo(&cls.netchan.message);
 }
 
@@ -390,7 +400,6 @@ Resend a connect message if the last one has timed out
 */
 void CL_CheckForResend(void)
 {
-    char tail[MAX_QPATH];
     char userinfo[MAX_INFO_STRING];
     int maxmsglen;
 
@@ -404,9 +413,8 @@ void CL_CheckForResend(void)
         strcpy(cls.servername, "localhost");
         cls.serverAddress.type = NA_LOOPBACK;
         cls.serverProtocol = cl_protocol->integer;
-        if (cls.serverProtocol < PROTOCOL_VERSION_DEFAULT ||
-            cls.serverProtocol > PROTOCOL_VERSION_Q2PRO) {
-            cls.serverProtocol = PROTOCOL_VERSION_Q2PRO;
+        if (cls.serverProtocol != PROTOCOL_VERSION_RERELEASE) {
+            cls.serverProtocol = PROTOCOL_VERSION_RERELEASE;
         }
 
         // we don't need a challenge on the localhost
@@ -451,42 +459,40 @@ void CL_CheckForResend(void)
         maxmsglen = MAX_PACKETLEN_WRITABLE;
     }
 
-    // add protocol dependent stuff
-    switch (cls.serverProtocol) {
-    case PROTOCOL_VERSION_R1Q2:
-        Q_snprintf(tail, sizeof(tail), " %d %d",
-                   maxmsglen, PROTOCOL_VERSION_R1Q2_CURRENT);
-        cls.quakePort = net_qport->integer & 0xff;
-        break;
-    case PROTOCOL_VERSION_Q2PRO:
-        Q_snprintf(tail, sizeof(tail), " %d %d %d %d",
-                   maxmsglen, net_chantype->integer, USE_ZLIB,
-                   PROTOCOL_VERSION_Q2PRO_CURRENT);
-        cls.quakePort = net_qport->integer & 0xff;
-        break;
-    default:
-        tail[0] = 0;
-        cls.quakePort = net_qport->integer;
-        break;
-    }
-
     Cvar_BitInfo(userinfo, CVAR_USERINFO);
+
+    q2proto_connect_t connect;
+    memset(&connect, 0, sizeof(connect));
+    connect.protocol = q2proto_protocol_from_netver(cls.serverProtocol);
+    connect.qport = net_qport->integer;
+    connect.challenge = cls.challenge;
+    connect.userinfo = q2proto_make_string(userinfo);
+    connect.packet_length = maxmsglen;
+    connect.q2pro_nctype = net_chantype->integer;
+
+    int err = q2proto_complete_connect(&connect);
+    if (err != Q2P_ERR_SUCCESS)
+        goto fail;
+    cls.quakePort = connect.qport;
+
+    char connect_args[MAX_PACKETLEN_DEFAULT - 16 /* space for command etc */];
+
+    err = q2proto_get_connect_arguments(connect_args, sizeof(connect_args), NULL, &connect);
+    if (err != Q2P_ERR_SUCCESS)
+        goto fail;
+
     Netchan_OutOfBand(NS_CLIENT, &cls.serverAddress,
-                      "connect %i %i %i \"%s\"%s\n", cls.serverProtocol, cls.quakePort,
-                      cls.challenge, userinfo, tail);
+                      "connect %s\n", connect_args);
+    return;
+
+fail:
+    Com_Error(ERR_DISCONNECT, "Could not get connect string (%d)", err);
 }
 
 static void CL_RecentIP_g(genctx_t *ctx)
 {
-    netadr_t *a;
-    int i, j;
-
-    j = cls.recent_head - RECENT_ADDR;
-    if (j < 0) {
-        j = 0;
-    }
-    for (i = cls.recent_head - 1; i >= j; i--) {
-        a = &cls.recent_addr[i & RECENT_MASK];
+    for (int i = 0; i < RECENT_ADDR; i++) {
+        const netadr_t *a = &cls.recent_addr[(cls.recent_head - i - 1) & RECENT_MASK];
         if (a->type) {
             Prompt_AddMatch(ctx, NET_AdrToString(a));
         }
@@ -563,27 +569,21 @@ static void CL_Connect_f(void)
 
 static void CL_FollowIP_f(void)
 {
-    netadr_t *a;
-    int i, j;
+    const netadr_t *a;
+    int i = 0;
 
     if (Cmd_Argc() > 1) {
         // optional second argument references less recent address
-        j = Q_clip(Q_atoi(Cmd_Argv(1)), 0, RECENT_ADDR - 1) + 1;
-    } else {
-        j = 1;
+        i = Q_clip(Q_atoi(Cmd_Argv(1)), 0, RECENT_ADDR - 1);
     }
 
-    i = cls.recent_head - j;
-    if (i < 0) {
-        Com_Printf("No IP address to follow.\n");
-        return;
-    }
-
-    a = &cls.recent_addr[i & RECENT_MASK];
+    a = &cls.recent_addr[(cls.recent_head - i - 1) & RECENT_MASK];
     if (a->type) {
-        char *s = NET_AdrToString(a);
+        const char *s = NET_AdrToString(a);
         Com_Printf("Following %s...\n", s);
         Cbuf_InsertText(cmd_current, va("connect %s\n", s));
+    } else {
+        Com_Printf("No IP address to follow.\n");
     }
 }
 
@@ -677,13 +677,12 @@ CL_ClearState
 void CL_ClearState(void)
 {
     S_StopAllSounds();
-    OGG_Stop();
     SCR_StopCinematic();
-    SCR_ClearCenterPrints();
     CL_ClearEffects();
     CL_ClearTEnts();
     LOC_FreeLocations();
     CL_FreeDemoSnapshots();
+    SCR_Clear();
 
     // wipe the entire cl structure
     BSP_Free(cl.bsp);
@@ -739,8 +738,9 @@ void CL_Disconnect(error_type_t type)
 
     if (cls.netchan.protocol) {
         // send a disconnect message to the server
-        MSG_WriteByte(clc_stringcmd);
-        MSG_WriteData("disconnect", 11);
+        q2proto_clc_message_t message = {.type = Q2P_CLC_STRINGCMD};
+        message.stringcmd.cmd = q2proto_make_string("disconnect");
+        q2proto_client_write(&cls.q2proto_ctx, Q2PROTO_IOARG_CLIENT_WRITE, &message);
 
         Netchan_Transmit(&cls.netchan, msg_write.cursize, msg_write.data, 3);
 
@@ -759,13 +759,19 @@ void CL_Disconnect(error_type_t type)
 
     CL_GTV_Suspend();
 
+    // Shutdown client game
+    if (cgame)
+        cgame->Shutdown();
+
     cls.state = ca_disconnected;
     cls.userinfo_modified = 0;
 
     if (type == ERR_DISCONNECT) {
         UI_OpenMenu(UIMENU_DEFAULT);
+        OGG_PlayMenu();
     } else {
         UI_OpenMenu(UIMENU_NONE);
+        Cbuf_ClearDeferred(&cmd_buffer);
     }
 
     CL_CheckForPause();
@@ -875,7 +881,7 @@ static void CL_ParseStatusResponse(serverStatus_t *status, const char *string)
         player = &status->players[status->numPlayers];
         player->score = Q_atoi(COM_Parse(&s));
         player->ping = Q_atoi(COM_Parse(&s));
-        Q_strlcpy(player->name, COM_Parse(&s), sizeof(player->name));
+        COM_ParseToken(&s, player->name, sizeof(player->name), PARSE_FLAG_NONE);
         if (!s)
             break;
         status->numPlayers++;
@@ -1231,7 +1237,7 @@ static void CL_ConnectionlessPacket(void)
 {
     char    string[MAX_STRING_CHARS];
     char    *s, *c;
-    int     i, j, k;
+    int     i, j;
 
     MSG_BeginReading();
     MSG_ReadLong(); // skip the -1
@@ -1249,8 +1255,6 @@ static void CL_ConnectionlessPacket(void)
 
     // challenge from the server we are connecting to
     if (!strcmp(c, "challenge")) {
-        int mask = 0;
-
         if (cls.state < ca_challenging) {
             Com_DPrintf("Challenge received while not connecting.  Ignored.\n");
             return;
@@ -1264,54 +1268,38 @@ static void CL_ConnectionlessPacket(void)
             return;
         }
 
-        cls.challenge = Q_atoi(Cmd_Argv(1));
         cls.state = ca_connecting;
         cls.connect_time -= CONNECT_INSTANT; // fire immediately
         //cls.connect_count = 0;
 
-        // parse additional parameters
-        j = Cmd_Argc();
-        for (i = 2; i < j; i++) {
-            s = Cmd_Argv(i);
-            if (!strncmp(s, "p=", 2)) {
-                s += 2;
-                while (*s) {
-                    k = strtoul(s, &s, 10);
-                    if (k == PROTOCOL_VERSION_R1Q2) {
-                        mask |= 1;
-                    } else if (k == PROTOCOL_VERSION_Q2PRO) {
-                        mask |= 2;
-                    }
-                    s = strchr(s, ',');
-                    if (s == NULL) {
-                        break;
-                    }
-                    s++;
-                }
+        q2proto_protocol_t accepted_protocols[Q2P_NUM_PROTOCOLS];
+        size_t num_accepted_protocols = 0;
+
+        if (cls.serverProtocol != 0) {
+            // Restrict accepted protocols if one was explicitly specified
+            q2proto_protocol_t user_protocol = q2proto_protocol_from_netver(cls.serverProtocol);
+            if (user_protocol == Q2P_PROTOCOL_INVALID) {
+                Com_EPrintf("Invalid protocol %d\n", cls.serverProtocol);
+                return;
             }
+            accepted_protocols[0] = user_protocol;
+            num_accepted_protocols = 1;
+        } else {
+            const q2proto_game_type_t supported_game_types[] = {Q2PROTO_GAME_VANILLA, Q2PROTO_GAME_Q2PRO_EXTENDED, Q2PROTO_GAME_Q2PRO_EXTENDED_V2, Q2PROTO_GAME_RERELEASE};
+            num_accepted_protocols = q2proto_get_protocols_for_gametypes(accepted_protocols, q_countof(accepted_protocols), supported_game_types, q_countof(supported_game_types));
         }
 
-        if (!cls.serverProtocol) {
-            cls.serverProtocol = PROTOCOL_VERSION_Q2PRO;
+        q2proto_challenge_t challenge;
+        q2proto_error_t parse_err;
+        parse_err = q2proto_parse_challenge(Cmd_Args(), accepted_protocols, num_accepted_protocols, &challenge);
+        if (parse_err != Q2P_ERR_SUCCESS) {
+            Com_DPrintf("Challenge parse error %d.  Ignored.\n", parse_err);
+            return;
         }
 
-        // choose supported protocol
-        switch (cls.serverProtocol) {
-        case PROTOCOL_VERSION_Q2PRO:
-            if (mask & 2) {
-                break;
-            }
-            cls.serverProtocol = PROTOCOL_VERSION_R1Q2;
-            // fall through
-        case PROTOCOL_VERSION_R1Q2:
-            if (mask & 1) {
-                break;
-            }
-            // fall through
-        default:
-            cls.serverProtocol = PROTOCOL_VERSION_DEFAULT;
-            break;
-        }
+        cls.challenge = challenge.challenge;
+        cls.serverProtocol = q2proto_get_protocol_netver(challenge.server_protocol);
+
         Com_DPrintf("Selected protocol %d\n", cls.serverProtocol);
 
         CL_CheckForResend();
@@ -1338,7 +1326,8 @@ static void CL_ConnectionlessPacket(void)
             return;
         }
 
-        if (cls.serverProtocol == PROTOCOL_VERSION_Q2PRO) {
+        if ((cls.serverProtocol == PROTOCOL_VERSION_Q2PRO)
+            || (cls.serverProtocol == PROTOCOL_VERSION_RERELEASE)){
             type = NETCHAN_NEW;
         } else {
             type = NETCHAN_OLD;
@@ -1383,10 +1372,14 @@ static void CL_ConnectionlessPacket(void)
         Netchan_Close(&cls.netchan);
         Netchan_Setup(&cls.netchan, NS_CLIENT, type, &cls.serverAddress,
                       cls.quakePort, 1024, cls.serverProtocol);
+        q2proto_init_clientcontext(&cls.q2proto_ctx);
 
 #if USE_AC_CLIENT
         if (anticheat) {
-            MSG_WriteByte(clc_nop);
+            q2proto_clc_message_t nop_message;
+            memset(&nop_message, 0, sizeof(nop_message));
+            nop_message.type = Q2P_CLC_NOP;
+            q2proto_client_write(&cls.q2proto_ctx, Q2PROTO_IOARG_CLIENT_WRITE, &nop_message);
             MSG_FlushTo(&cls.netchan.message);
             Netchan_Transmit(&cls.netchan, 0, NULL, 3);
             S_StopAllSounds();
@@ -1415,16 +1408,18 @@ static void CL_ConnectionlessPacket(void)
     }
 
     if (!strcmp(c, "passive_connect")) {
+        const char *adr;
+
         if (!cls.passive) {
             Com_DPrintf("Passive connect received while not connecting.  Ignored.\n");
             return;
         }
-        s = NET_AdrToString(&net_from);
-        Com_Printf("Received passive connect from %s.\n", s);
+        adr = NET_AdrToString(&net_from);
+        Com_Printf("Received passive connect from %s.\n", adr);
 
         cls.serverAddress = net_from;
         cls.serverProtocol = cl_protocol->integer;
-        Q_strlcpy(cls.servername, s, sizeof(cls.servername));
+        Q_strlcpy(cls.servername, adr, sizeof(cls.servername));
         cls.passive = false;
 
         cls.state = ca_challenging;
@@ -1498,7 +1493,11 @@ static void CL_PacketEvent(void)
     cls.errorReceived = false; // don't drop
 #endif
 
+    cl.suppress_count = 0;
+
     CL_ParseServerMessage();
+
+    SCR_AddNetgraph();
 
     SCR_LagSample();
 
@@ -1512,7 +1511,7 @@ static void CL_PacketEvent(void)
 }
 
 #if USE_ICMP
-void CL_ErrorEvent(netadr_t *from)
+void CL_ErrorEvent(const netadr_t *from)
 {
     UI_ErrorEvent(from);
 
@@ -1558,7 +1557,7 @@ static void CL_FixUpGender(void)
         Cvar_Set("gender", "female");
     else
         Cvar_Set("gender", "none");
-    info_gender->modified = false;
+    info_gender->modified_count = 0;
 }
 
 void CL_UpdateUserinfo(cvar_t *var, from_t from)
@@ -1827,7 +1826,7 @@ typedef struct {
 static list_t   cl_ignore_text;
 static list_t   cl_ignore_nick;
 
-static ignore_t *find_ignore(list_t *list, const char *match)
+static ignore_t *find_ignore(const list_t *list, const char *match)
 {
     ignore_t *ignore;
 
@@ -1840,7 +1839,7 @@ static ignore_t *find_ignore(list_t *list, const char *match)
     return NULL;
 }
 
-static void list_ignores(list_t *list)
+static void list_ignores(const list_t *list)
 {
     ignore_t *ignore;
 
@@ -2087,7 +2086,7 @@ static void CL_DumpStatusbar_f(void)
 
 static void CL_DumpLayout_f(void)
 {
-    dump_program(cl.layout, "layout");
+    dump_program(cl.cgame_data.layout, "layout");
 }
 
 static const cmd_option_t o_writeconfig[] = {
@@ -2158,7 +2157,7 @@ static void CL_WriteConfig_f(void)
         return;
     }
 
-    FS_FPrintf(f, "// generated by q2pro\n");
+    FS_FPrintf(f, "// generated by " APPLICATION "\n");
 
     if (bindings) {
         FS_FPrintf(f, "\n// key bindings\n");
@@ -2202,10 +2201,10 @@ static size_t CL_Ups_m(char *buffer, size_t size)
         !(cl.frame.ps.pmove.pm_flags & PMF_NO_PREDICTION)) {
         VectorCopy(cl.predicted_velocity, vel);
     } else {
-        VectorScale(cl.frame.ps.pmove.velocity, 0.125f, vel);
+        VectorCopy(cl.frame.ps.pmove.velocity, vel);
     }
 
-    return Q_scnprintf(buffer, size, "%.f", VectorLength(vel));
+    return Q_snprintf(buffer, size, "%.f", VectorLength(vel));
 }
 
 static size_t CL_Timer_m(char *buffer, size_t size)
@@ -2217,9 +2216,9 @@ static size_t CL_Timer_m(char *buffer, size_t size)
     hour = min / 60; min %= 60;
 
     if (hour) {
-        return Q_scnprintf(buffer, size, "%i:%i:%02i", hour, min, sec);
+        return Q_snprintf(buffer, size, "%i:%i:%02i", hour, min, sec);
     }
-    return Q_scnprintf(buffer, size, "%i:%02i", min, sec);
+    return Q_snprintf(buffer, size, "%i:%02i", min, sec);
 }
 
 static size_t CL_DemoPos_m(char *buffer, size_t size)
@@ -2231,35 +2230,35 @@ static size_t CL_DemoPos_m(char *buffer, size_t size)
     else if (!MVD_GetDemoStatus(NULL, NULL, &framenum))
         framenum = 0;
 
-    sec = framenum / 10; framenum %= 10;
+    sec = framenum / BASE_FRAMERATE; framenum %= BASE_FRAMERATE;
     min = sec / 60; sec %= 60;
 
-    return Q_scnprintf(buffer, size, "%d:%02d.%d", min, sec, framenum);
+    return Q_snprintf(buffer, size, "%d:%02d.%d", min, sec, framenum);
 }
 
 static size_t CL_Fps_m(char *buffer, size_t size)
 {
-    return Q_scnprintf(buffer, size, "%i", C_FPS);
+    return Q_snprintf(buffer, size, "%i", C_FPS);
 }
 
 static size_t R_Fps_m(char *buffer, size_t size)
 {
-    return Q_scnprintf(buffer, size, "%i", R_FPS);
+    return Q_snprintf(buffer, size, "%i", R_FPS);
 }
 
 static size_t CL_Mps_m(char *buffer, size_t size)
 {
-    return Q_scnprintf(buffer, size, "%i", C_MPS);
+    return Q_snprintf(buffer, size, "%i", C_MPS);
 }
 
 static size_t CL_Pps_m(char *buffer, size_t size)
 {
-    return Q_scnprintf(buffer, size, "%i", C_PPS);
+    return Q_snprintf(buffer, size, "%i", C_PPS);
 }
 
 static size_t CL_Ping_m(char *buffer, size_t size)
 {
-    return Q_scnprintf(buffer, size, "%i", cls.measure.ping);
+    return Q_snprintf(buffer, size, "%i", cls.measure.ping);
 }
 
 static size_t CL_Lag_m(char *buffer, size_t size)
@@ -2269,33 +2268,46 @@ static size_t CL_Lag_m(char *buffer, size_t size)
     if (cls.netchan.total_received)
         f = (float)cls.netchan.total_dropped / cls.netchan.total_received;
 
-    return Q_scnprintf(buffer, size, "%.2f%%", f * 100.0f);
+    return Q_snprintf(buffer, size, "%.2f%%", f * 100.0f);
 }
 
 static size_t CL_Health_m(char *buffer, size_t size)
 {
-    return Q_scnprintf(buffer, size, "%i", cl.frame.ps.stats[STAT_HEALTH]);
+    return Q_snprintf(buffer, size, "%i", cl.frame.ps.stats[STAT_HEALTH]);
 }
 
 static size_t CL_Ammo_m(char *buffer, size_t size)
 {
-    return Q_scnprintf(buffer, size, "%i", cl.frame.ps.stats[STAT_AMMO]);
+    return Q_snprintf(buffer, size, "%i", cl.frame.ps.stats[STAT_AMMO]);
 }
 
 static size_t CL_Armor_m(char *buffer, size_t size)
 {
-    return Q_scnprintf(buffer, size, "%i", cl.frame.ps.stats[STAT_ARMOR]);
+    return Q_snprintf(buffer, size, "%i", cl.frame.ps.stats[STAT_ARMOR]);
 }
 
 static size_t CL_WeaponModel_m(char *buffer, size_t size)
 {
-    int i = cl.csr.models + (cl.frame.ps.gunindex & GUNINDEX_MASK);
+    int i = cl.csr.models + cl.frame.ps.gunindex;
     return Q_strlcpy(buffer, cl.configstrings[i], size);
 }
 
 static size_t CL_NumEntities_m(char *buffer, size_t size)
 {
-    return Q_scnprintf(buffer, size, "%i", cl.frame.numEntities);
+    return Q_snprintf(buffer, size, "%i", cl.frame.numEntities);
+}
+
+static size_t CL_Surface_m(char *buffer, size_t size)
+{
+    trace_t trace;
+    vec3_t end;
+
+    if (cls.state != ca_active)
+        return Q_strlcpy(buffer, "", size);
+
+    VectorMA(cl.refdef.vieworg, 8192, cl.v_forward, end);
+    CL_Trace(&trace, cl.refdef.vieworg, end, vec3_origin, vec3_origin, NULL, MASK_SOLID | MASK_WATER);
+    return Q_strlcpy(buffer, trace.surface->name, size);
 }
 
 /*
@@ -2376,6 +2388,7 @@ void CL_RestartFilesystem(bool total)
 
     if (cls_state == ca_disconnected) {
         UI_OpenMenu(UIMENU_DEFAULT);
+        OGG_PlayMenu();
     } else if (cls_state >= ca_loading && cls_state <= ca_active) {
         CL_LoadState(LOAD_MAP);
         CL_PrepRefresh();
@@ -2434,6 +2447,7 @@ void CL_RestartRefresh(bool total)
 
     if (cls_state == ca_disconnected) {
         UI_OpenMenu(UIMENU_DEFAULT);
+        OGG_PlayMenu();
     } else if (cls_state >= ca_loading && cls_state <= ca_active) {
         CL_LoadState(LOAD_MAP);
         CL_PrepRefresh();
@@ -2497,9 +2511,15 @@ static bool allow_stufftext(const char *text)
 {
     string_entry_t *entry;
 
+    if (cl_ignore_stufftext->integer <= 0)
+        return true;
+
     for (entry = cls.stufftextwhitelist; entry; entry = entry->next)
         if (Com_WildCmp(entry->string, text))
             return true;
+
+    if (cl_ignore_stufftext->integer >= 2)
+        Com_WPrintf("Ignored stufftext: %s\n", text);
 
     return false;
 }
@@ -2531,7 +2551,7 @@ static void exec_server_string(cmdbuf_t *buf, const char *text)
     }
 
     // forbid nearly every command from demos
-    if (cls.demo.playback) {
+    if (cls.demo.playback && !cls.demo.compat) {
         if (strcmp(s, "play")) {
             return;
         }
@@ -2547,9 +2567,8 @@ static void exec_server_string(cmdbuf_t *buf, const char *text)
         return;
     }
 
-    if (cl_ignore_stufftext->integer >= 1 && !allow_stufftext(text)) {
-        if (cl_ignore_stufftext->integer >= 2)
-            Com_WPrintf("Ignored stufftext: %s\n", text);
+    // optional whitelist filtering
+    if (!allow_stufftext(text)) {
         return;
     }
 
@@ -2594,49 +2613,9 @@ static void cl_flares_changed(cvar_t *self)
     CL_UpdateFlaresSetting();
 }
 
-static inline int fps_to_msec(int fps)
-{
-#if 0
-    return (1000 + fps / 2) / fps;
-#else
-    return 1000 / fps;
-#endif
-}
-
-static void warn_on_fps_rounding(cvar_t *cvar)
-{
-    static bool warned = false;
-    int msec, real_maxfps;
-
-    if (cvar->integer <= 0 || cl_warn_on_fps_rounding->integer <= 0)
-        return;
-
-    msec = fps_to_msec(cvar->integer);
-    if (!msec)
-        return;
-
-    real_maxfps = 1000 / msec;
-    if (cvar->integer == real_maxfps)
-        return;
-
-    Com_WPrintf("%s value `%d' is inexact, using `%d' instead.\n",
-                cvar->name, cvar->integer, real_maxfps);
-    if (!warned) {
-        Com_Printf("(Set `%s' to `0' to disable this warning.)\n",
-                   cl_warn_on_fps_rounding->name);
-        warned = true;
-    }
-}
-
 static void cl_sync_changed(cvar_t *self)
 {
     CL_UpdateFrameTimes();
-}
-
-static void cl_maxfps_changed(cvar_t *self)
-{
-    CL_UpdateFrameTimes();
-    warn_on_fps_rounding(self);
 }
 
 // allow downloads to be permanently disabled as a
@@ -2682,10 +2661,6 @@ static const cmdreg_t c_client[] = {
     { "reconnect", CL_Reconnect_f },
     { "rcon", CL_Rcon_f, CL_Rcon_c },
     { "serverstatus", CL_ServerStatus_f, CL_ServerStatus_c },
-    { "ignoretext", CL_IgnoreText_f },
-    { "unignoretext", CL_UnIgnoreText_f },
-    { "ignorenick", CL_IgnoreNick_f, CL_IgnoreNick_c },
-    { "unignorenick", CL_UnIgnoreNick_f, CL_UnIgnoreNick_c },
     { "dumpclients", CL_DumpClients_f },
     { "dumpstatusbar", CL_DumpStatusbar_f },
     { "dumplayout", CL_DumpLayout_f },
@@ -2731,10 +2706,8 @@ static void CL_InitLocal(void)
     CL_InitEffects();
     CL_InitTEnts();
     CL_InitDownloads();
+    CL_Wheel_Init();
     CL_GTV_Init();
-
-    List_Init(&cl_ignore_text);
-    List_Init(&cl_ignore_nick);
 
     Cmd_Register(c_client);
 
@@ -2762,23 +2735,22 @@ static void CL_InitLocal(void)
     cl_kickangles = Cvar_Get("cl_kickangles", "1", CVAR_CHEAT);
     cl_warn_on_fps_rounding = Cvar_Get("cl_warn_on_fps_rounding", "1", 0);
     cl_maxfps = Cvar_Get("cl_maxfps", "62", 0);
-    cl_maxfps->changed = cl_maxfps_changed;
+    cl_maxfps->changed = cl_sync_changed;
     cl_async = Cvar_Get("cl_async", "1", 0);
     cl_async->changed = cl_sync_changed;
     r_maxfps = Cvar_Get("r_maxfps", "0", 0);
-    r_maxfps->changed = cl_maxfps_changed;
+    r_maxfps->changed = cl_sync_changed;
     cl_autopause = Cvar_Get("cl_autopause", "1", 0);
     cl_rollhack = Cvar_Get("cl_rollhack", "1", 0);
     cl_noglow = Cvar_Get("cl_noglow", "0", 0);
     cl_nobob = Cvar_Get("cl_nobob", "0", 0);
     cl_nolerp = Cvar_Get("cl_nolerp", "0", 0);
+    cl_hit_markers = Cvar_Get("cl_hit_markers", "2", 0);
 
     // hack for timedemo
     com_timedemo->changed = cl_sync_changed;
 
     CL_UpdateFrameTimes();
-    warn_on_fps_rounding(cl_maxfps);
-    warn_on_fps_rounding(r_maxfps);
 
 #if USE_DEBUG
     cl_shownet = Cvar_Get("cl_shownet", "0", 0);
@@ -2841,6 +2813,7 @@ static void CL_InitLocal(void)
     info_password = Cvar_Get("password", "", CVAR_USERINFO);
     info_spectator = Cvar_Get("spectator", "0", CVAR_USERINFO);
     info_name = Cvar_Get("name", "unnamed", CVAR_USERINFO | CVAR_ARCHIVE);
+    info_dogtag = Cvar_Get("dogtag", "default", CVAR_USERINFO | CVAR_ARCHIVE);
     info_skin = Cvar_Get("skin", "male/grunt", CVAR_USERINFO | CVAR_ARCHIVE);
     info_rate = Cvar_Get("rate", "15000", CVAR_USERINFO | CVAR_ARCHIVE);
     info_msg = Cvar_Get("msg", "1", CVAR_USERINFO | CVAR_ARCHIVE);
@@ -2848,7 +2821,7 @@ static void CL_InitLocal(void)
     info_hand->changed = info_hand_changed;
     info_fov = Cvar_Get("fov", "90", CVAR_USERINFO | CVAR_ARCHIVE);
     info_gender = Cvar_Get("gender", "male", CVAR_USERINFO | CVAR_ARCHIVE);
-    info_gender->modified = false; // clear this so we know when user sets it manually
+    info_gender->modified_count = 0; // clear this so we know when user sets it manually
     info_uf = Cvar_Get("uf", "", CVAR_USERINFO);
 
 
@@ -2871,6 +2844,33 @@ static void CL_InitLocal(void)
     Cmd_AddMacro("cl_armor", CL_Armor_m);
     Cmd_AddMacro("cl_weaponmodel", CL_WeaponModel_m);
     Cmd_AddMacro("cl_numentities", CL_NumEntities_m);
+    Cmd_AddMacro("cl_surface", CL_Surface_m);
+}
+
+static const cmdreg_t c_ignores[] = {
+    { "ignoretext", CL_IgnoreText_f },
+    { "unignoretext", CL_UnIgnoreText_f },
+    { "ignorenick", CL_IgnoreNick_f, CL_IgnoreNick_c },
+    { "unignorenick", CL_UnIgnoreNick_f, CL_UnIgnoreNick_c },
+    { NULL }
+};
+
+/*
+=================
+CL_PreInit
+
+Called before executing configs to register commands such as `bind' or
+`ignoretext'.
+=================
+*/
+void CL_PreInit(void)
+{
+    Key_Init();
+
+    List_Init(&cl_ignore_text);
+    List_Init(&cl_ignore_nick);
+
+    Cmd_Register(c_ignores);
 }
 
 /*
@@ -3121,13 +3121,54 @@ static sync_mode_t sync_mode;
 #define MIN_REF_HZ MIN_PHYS_HZ
 #define MAX_REF_HZ 1000
 
-static int fps_to_clamped_msec(cvar_t *cvar, int min, int max)
+static inline int fps_to_msec(int fps)
 {
+    return 1000 / fps;
+}
+
+static void warn_on_fps_rounding(const cvar_t *cvar, int msec)
+{
+    static bool warned = false;
+    int real_maxfps;
+
+    if (cl_warn_on_fps_rounding->integer <= 0)
+        return;
+
+    if (!msec)
+        return;
+
+    real_maxfps = 1000 / msec;
+    if (cvar->integer == real_maxfps)
+        return;
+
+    Com_WPrintf("%s value `%d' is inexact and will be rounded to `%d'.\n",
+                cvar->name, cvar->integer, real_maxfps);
+    if (!warned) {
+        Com_Printf("(Set `%s' to `0' to disable this warning.)\n",
+                   cl_warn_on_fps_rounding->name);
+        warned = true;
+    }
+}
+
+static int fps_to_clamped_msec(cvar_t *cvar, int min, int max, int32_t* modified_count)
+{
+    int msec;
+
     if (cvar->integer == 0)
         return fps_to_msec(max);
-    else
-        return fps_to_msec(Cvar_ClampInteger(cvar, min, max));
+
+    msec = fps_to_msec(Cvar_ClampInteger(cvar, min, max));
+
+    if (cvar->modified_count != *modified_count) {
+        warn_on_fps_rounding(cvar, msec);
+        *modified_count = cvar->modified_count;
+    }
+
+    return msec;
 }
+
+static int32_t cl_maxfps_modified;
+static int32_t r_maxfps_modified;
 
 /*
 ==================
@@ -3158,17 +3199,38 @@ void CL_UpdateFrameTimes(void)
         sync_mode = SYNC_SLEEP_60;
     } else if (cl_async->integer > 0) {
         // run physics and refresh separately
-        phys_msec = fps_to_clamped_msec(cl_maxfps, MIN_PHYS_HZ, MAX_PHYS_HZ);
-        ref_msec = fps_to_clamped_msec(r_maxfps, MIN_REF_HZ, MAX_REF_HZ);
+        phys_msec = fps_to_clamped_msec(cl_maxfps, MIN_PHYS_HZ, MAX_PHYS_HZ, &cl_maxfps_modified);
+        ref_msec = fps_to_clamped_msec(r_maxfps, MIN_REF_HZ, MAX_REF_HZ, &r_maxfps_modified);
         sync_mode = ASYNC_FULL;
     } else {
         // everything ticks in sync with refresh
-        main_msec = fps_to_clamped_msec(cl_maxfps, MIN_PHYS_HZ, MAX_PHYS_HZ);
+        main_msec = fps_to_clamped_msec(cl_maxfps, MIN_PHYS_HZ, MAX_PHYS_HZ, &cl_maxfps_modified);
         sync_mode = SYNC_MAXFPS;
     }
 
     Com_DDPrintf("%s: mode=%s main_msec=%d ref_msec=%d, phys_msec=%d\n",
                  __func__, sync_names[sync_mode], main_msec, ref_msec, phys_msec);
+}
+
+void CL_AddHitMarker(void)
+{
+    if (cl.hit_marker_frame != cl.frame.number) {
+        cl.hit_marker_frame = cl.frame.number;
+        cl.hit_marker_time = cls.realtime;
+        cl.hit_marker_count++;
+
+        if (cl_hit_markers->integer > 1)
+            S_StartSound(NULL, listener_entnum, 257, cl.sfx_hit_marker, 1, ATTN_NONE, 0);
+    }
+}
+
+static void CL_UpdateHitMarkers(void)
+{
+    if (cl.game_type != Q2PROTO_GAME_RERELEASE || !cl_hit_markers->integer)
+        return;
+
+    if (cgame->GetHitMarkerDamage(&cl.frame.ps))
+        CL_AddHitMarker();
 }
 
 /*
@@ -3291,9 +3353,15 @@ unsigned CL_Frame(unsigned msec)
     // predict all unacknowledged movements
     CL_PredictMovement();
 
+    // update weapon wheel stuff
+    CL_Wheel_Update();
+
     Con_RunConsole();
 
     SCR_RunCinematic();
+
+    // Update hit marker status from cgame
+    CL_UpdateHitMarkers();
 
     UI_Frame(main_extra);
 
@@ -3324,8 +3392,6 @@ unsigned CL_Frame(unsigned msec)
     C_FRAMES++;
 
     CL_MeasureStats();
-
-    cls.framecount++;
 
     main_extra = 0;
     return 0;
@@ -3363,6 +3429,31 @@ bool CL_ProcessEvents(void)
 
 /*
 ====================
+CL_Client_Timings_stat
+====================
+*/
+static void CL_Client_Timings_stat(void)
+{
+    SCR_StatKeyValueu("realtime", cls.realtime);
+    SCR_StatKeyValueu("com_localTime", com_localTime);
+    SCR_StatKeyValueu("com_localTime2", com_localTime2);
+    SCR_StatKeyValueu("time", cl.time);
+    SCR_StatKeyValueu("servertime", cl.servertime);
+    SCR_StatKeyValuef("frametime", cls.frametime);
+}
+
+/*
+====================
+CL_Client_Timings_stat
+====================
+*/
+static void CL_Client_Prediction_stat(void)
+{
+    SCR_StatKeyValuev("error", cl.prediction_error);
+}
+
+/*
+====================
 CL_Init
 ====================
 */
@@ -3381,10 +3472,10 @@ void CL_Init(void)
     // start with full screen console
     cls.key_dest = KEY_CONSOLE;
 
+    CL_InitLocal();
     CL_InitRefresh();
     S_Init();   // sound must be initialized after window is created
 
-    CL_InitLocal();
     IN_Init();
 
 #if USE_ZLIB
@@ -3401,6 +3492,8 @@ void CL_Init(void)
 
     UI_OpenMenu(UIMENU_DEFAULT);
 
+    OGG_PlayMenu();
+
     Con_PostInit();
     Con_RunConsole();
 
@@ -3408,6 +3501,9 @@ void CL_Init(void)
     cl_cmdbuf.text = cl_cmdbuf_text;
     cl_cmdbuf.maxsize = sizeof(cl_cmdbuf_text);
     cl_cmdbuf.exec = exec_server_string;
+    
+    SCR_RegisterStat("client.timings", CL_Client_Timings_stat);
+    SCR_RegisterStat("client.prediction", CL_Client_Prediction_stat);
 
     Cvar_Set("cl_running", "1");
 }
@@ -3449,6 +3545,10 @@ void CL_Shutdown(void)
     Con_Shutdown();
     CL_ShutdownRefresh();
     CL_WriteConfig();
+    CG_Unload();
+    
+    SCR_UnregisterStat("client.timings");
+    SCR_UnregisterStat("client.prediction");
 
     memset(&cls, 0, sizeof(cls));
 

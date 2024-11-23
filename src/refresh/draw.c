@@ -20,34 +20,28 @@ with this program; if not, write to the Free Software Foundation, Inc.,
 
 drawStatic_t draw;
 
-static inline void _GL_StretchPic(
-    float x, float y, float w, float h,
-    float s1, float t1, float s2, float t2,
-    uint32_t color, int texnum, int flags)
+// the final process in drawing any pic
+static inline void GL_DrawPic(
+    vec2_t vertices[4], vec2_t texcoords[4],
+    color_t color, int texnum, int flags)
 {
-    vec_t *dst_vert;
-    uint32_t *dst_color;
-    QGL_INDEX_TYPE *dst_indices;
+    glVertexDesc2D_t *dst_vert;
+    glIndex_t *dst_indices;
 
     if (tess.numverts + 4 > TESS_MAX_VERTICES ||
         tess.numindices + 6 > TESS_MAX_INDICES ||
-        (tess.numverts && tess.texnum[0] != texnum)) {
+        (tess.numverts && tess.texnum[TMU_TEXTURE] != texnum))
         GL_Flush2D();
+
+    tess.texnum[TMU_TEXTURE] = texnum;
+
+    dst_vert = ((glVertexDesc2D_t *) tess.vertices) + tess.numverts;
+
+    for (int i = 0; i < 4; i++, dst_vert++) {
+        Vector2Copy(vertices[i], dst_vert->xy);
+        Vector2Copy(texcoords[i], dst_vert->st);
+        dst_vert->c = color.u32;
     }
-
-    tess.texnum[0] = texnum;
-
-    dst_vert = tess.vertices + tess.numverts * 4;
-    Vector4Set(dst_vert,      x,     y,     s1, t1);
-    Vector4Set(dst_vert +  4, x + w, y,     s2, t1);
-    Vector4Set(dst_vert +  8, x + w, y + h, s2, t2);
-    Vector4Set(dst_vert + 12, x,     y + h, s1, t2);
-
-    dst_color = (uint32_t *)tess.colors + tess.numverts;
-    dst_color[0] = color;
-    dst_color[1] = color;
-    dst_color[2] = color;
-    dst_color[3] = color;
 
     dst_indices = tess.indices + tess.numindices;
     dst_indices[0] = tess.numverts + 0;
@@ -58,53 +52,176 @@ static inline void _GL_StretchPic(
     dst_indices[5] = tess.numverts + 2;
 
     if (flags & IF_TRANSPARENT) {
-        if ((flags & IF_PALETTED) && draw.scale == 1) {
-            tess.flags |= 1;
-        } else {
-            tess.flags |= 2;
-        }
+        if ((flags & IF_PALETTED) && draw.scale == 1)
+            tess.flags |= GLS_ALPHATEST_ENABLE;
+        else
+            tess.flags |= GLS_BLEND_BLEND;
     }
 
-    if ((color & U32_ALPHA) != U32_ALPHA) {
-        tess.flags |= 2;
-    }
+    if (color.a != 255)
+        tess.flags |= GLS_BLEND_BLEND;
 
     tess.numverts += 4;
     tess.numindices += 6;
 }
 
+static inline void GL_StretchPic_(
+    float x, float y, float w, float h,
+    float s1, float t1, float s2, float t2,
+    color_t color, int texnum, int flags)
+{
+    vec2_t vertices[4], texcoords[4];
+
+    Vector2Set(vertices[0], x,     y    );
+    Vector2Set(vertices[1], x + w, y    );
+    Vector2Set(vertices[2], x + w, y + h);
+    Vector2Set(vertices[3], x,     y + h);
+
+    Vector2Set(texcoords[0], s1, t1);
+    Vector2Set(texcoords[1], s2, t1);
+    Vector2Set(texcoords[2], s2, t2);
+    Vector2Set(texcoords[3], s1, t2);
+
+    GL_DrawPic(vertices, texcoords, color, texnum, flags);
+}
+
 #define GL_StretchPic(x,y,w,h,s1,t1,s2,t2,color,image) \
-    _GL_StretchPic(x,y,w,h,s1,t1,s2,t2,color,(image)->texnum,(image)->flags)
+    GL_StretchPic_(x,y,w,h,s1,t1,s2,t2,color,(image)->texnum,(image)->flags)
+
+static inline void GL_StretchRotatePic_(
+    float x, float y, float w, float h,
+    float s1, float t1, float s2, float t2,
+    float angle, float pivot_x, float pivot_y,
+    color_t color, int texnum, int flags)
+{
+    vec2_t vertices[4], texcoords[4];
+
+    float hw = w / 2.0f;
+    float hh = h / 2.0f;
+
+    Vector2Set(vertices[0], -hw + pivot_x, -hh + pivot_y);
+    Vector2Set(vertices[1],  hw + pivot_x, -hh + pivot_y);
+    Vector2Set(vertices[2],  hw + pivot_x,  hh + pivot_y);
+    Vector2Set(vertices[3], -hw + pivot_x,  hh + pivot_y);
+
+    Vector2Set(texcoords[0], s1, t1);
+    Vector2Set(texcoords[1], s2, t1);
+    Vector2Set(texcoords[2], s2, t2);
+    Vector2Set(texcoords[3], s1, t2);
+
+    float s = sinf(angle);
+    float c = cosf(angle);
+
+    for (int i = 0; i < 4; i++) {
+        float vert_x = vertices[i][0];
+        float vert_y = vertices[i][1];
+        
+        vertices[i][0] = (vert_x * c - vert_y * s) + x;
+        vertices[i][1] = (vert_x * s + vert_y * c) + y;
+    }
+
+    GL_DrawPic(vertices, texcoords, color, texnum, flags);
+}
+
+#define GL_StretchRotatePic(x,y,w,h,s1,t1,s2,t2,angle,px,py,color,image) \
+    GL_StretchRotatePic_(x,y,w,h,s1,t1,s2,t2,angle,px,py,color,(image)->texnum,(image)->flags)
+
+static void GL_DrawVignette(float frac, color_t outer, color_t inner)
+{
+    static const byte indices[24] = {
+        0, 5, 4, 0, 1, 5, 1, 6, 5, 1, 2, 6, 6, 2, 3, 6, 3, 7, 0, 7, 3, 0, 4, 7
+    };
+    vec_t *dst_vert;
+    glIndex_t *dst_indices;
+
+    if (tess.numverts + 8 > TESS_MAX_VERTICES ||
+        tess.numindices + 24 > TESS_MAX_INDICES ||
+        (tess.numverts && tess.texnum[TMU_TEXTURE] != TEXNUM_WHITE))
+        GL_Flush2D();
+
+    tess.texnum[TMU_TEXTURE] = TEXNUM_WHITE;
+
+    int x = 0, y = 0;
+    int w = glr.fd.width, h = glr.fd.height;
+    int distance = min(w, h) * frac;
+
+    // outer vertices
+    dst_vert = tess.vertices + tess.numverts * 5;
+    Vector4Set(dst_vert,      x,     y,     0, 0);
+    Vector4Set(dst_vert +  5, x + w, y,     0, 0);
+    Vector4Set(dst_vert + 10, x + w, y + h, 0, 0);
+    Vector4Set(dst_vert + 15, x,     y + h, 0, 0);
+
+    WN32(dst_vert +  4, outer.u32);
+    WN32(dst_vert +  9, outer.u32);
+    WN32(dst_vert + 14, outer.u32);
+    WN32(dst_vert + 19, outer.u32);
+
+    // inner vertices
+    x += distance;
+    y += distance;
+    w -= distance * 2;
+    h -= distance * 2;
+
+    dst_vert += 20;
+    Vector4Set(dst_vert,      x,     y,     0, 0);
+    Vector4Set(dst_vert +  5, x + w, y,     0, 0);
+    Vector4Set(dst_vert + 10, x + w, y + h, 0, 0);
+    Vector4Set(dst_vert + 15, x,     y + h, 0, 0);
+
+    WN32(dst_vert +  4, inner.u32);
+    WN32(dst_vert +  9, inner.u32);
+    WN32(dst_vert + 14, inner.u32);
+    WN32(dst_vert + 19, inner.u32);
+
+    /*
+    0             1
+        4     5
+
+        7     6
+    3             2
+    */
+
+    dst_indices = tess.indices + tess.numindices;
+    for (int i = 0; i < 24; i++)
+        dst_indices[i] = tess.numverts + indices[i];
+
+    tess.flags |= GLS_BLEND_BLEND | GLS_SHADE_SMOOTH;
+
+    tess.numverts += 8;
+    tess.numindices += 24;
+}
 
 void GL_Blend(void)
 {
-    color_t color;
+    if (glr.fd.screen_blend[3]) {
+        color_t color;
 
-    color.u8[0] = glr.fd.blend[0] * 255;
-    color.u8[1] = glr.fd.blend[1] * 255;
-    color.u8[2] = glr.fd.blend[2] * 255;
-    color.u8[3] = glr.fd.blend[3] * 255;
+        color.r = glr.fd.screen_blend[0] * 255;
+        color.g = glr.fd.screen_blend[1] * 255;
+        color.b = glr.fd.screen_blend[2] * 255;
+        color.a = glr.fd.screen_blend[3] * 255;
 
-    _GL_StretchPic(glr.fd.x, glr.fd.y, glr.fd.width, glr.fd.height, 0, 0, 1, 1,
-                   color.u32, TEXNUM_WHITE, 0);
-}
+        GL_StretchPic_(glr.fd.x, glr.fd.y, glr.fd.width, glr.fd.height, 0, 0, 1, 1,
+                       color, TEXNUM_WHITE, 0);
+    }
 
-void R_ClearColor(void)
-{
-    draw.colors[0].u32 = U32_WHITE;
-    draw.colors[1].u32 = U32_WHITE;
-}
+    if (glr.fd.damage_blend[3]) {
+        color_t outer, inner;
 
-void R_SetAlpha(float alpha)
-{
-    draw.colors[0].u8[3] =
-        draw.colors[1].u8[3] = alpha * 255;
-}
+        outer.r = glr.fd.damage_blend[0] * 255;
+        outer.g = glr.fd.damage_blend[1] * 255;
+        outer.b = glr.fd.damage_blend[2] * 255;
+        outer.a = glr.fd.damage_blend[3] * 255;
 
-void R_SetColor(uint32_t color)
-{
-    draw.colors[0].u32 = color;
-    draw.colors[1].u8[3] = draw.colors[0].u8[3];
+        inner = COLOR_SETA_U8(outer, 0);
+
+        if (gl_damageblend_frac->value > 0)
+            GL_DrawVignette(Cvar_ClampValue(gl_damageblend_frac, 0, 0.5f), outer, inner);
+        else
+            GL_StretchPic_(glr.fd.x, glr.fd.y, glr.fd.width, glr.fd.height, 0, 0, 1, 1,
+                           outer, TEXNUM_WHITE, 0);
+    }
 }
 
 void R_SetClipRect(const clipRect_t *clip)
@@ -156,7 +273,7 @@ static int get_auto_scale(void)
     if (r_config.height < r_config.width) {
         if (r_config.height >= 2160)
             scale = 4;
-        else if (r_config.height >= 1080)
+        else if (r_config.height >= 720)
             scale = 2;
     } else {
         if (r_config.width >= 3840)
@@ -165,8 +282,8 @@ static int get_auto_scale(void)
             scale = 2;
     }
 
-    if (vid.get_dpi_scale) {
-        int min_scale = vid.get_dpi_scale();
+    if (vid && vid->get_dpi_scale) {
+        int min_scale = vid->get_dpi_scale();
         return max(scale, min_scale);
     }
 
@@ -186,9 +303,8 @@ float R_ClampScale(cvar_t *var)
 
 void R_SetScale(float scale)
 {
-    if (draw.scale == scale) {
+    if (draw.scale == scale)
         return;
-    }
 
     GL_Flush2D();
 
@@ -198,20 +314,28 @@ void R_SetScale(float scale)
     draw.scale = scale;
 }
 
-void R_DrawStretchPic(int x, int y, int w, int h, qhandle_t pic)
+void R_DrawStretchPic(int x, int y, int w, int h, color_t color, qhandle_t pic)
 {
-    image_t *image = IMG_ForHandle(pic);
+    const image_t *image = IMG_ForHandle(pic);
 
     GL_StretchPic(x, y, w, h, image->sl, image->tl, image->sh, image->th,
-                  draw.colors[0].u32, image);
+                  color, image);
 }
 
-void R_DrawKeepAspectPic(int x, int y, int w, int h, qhandle_t pic)
+void R_DrawStretchRotatePic(int x, int y, int w, int h, color_t color, float angle, int pivot_x, int pivot_y, qhandle_t pic)
 {
     image_t *image = IMG_ForHandle(pic);
 
+    GL_StretchRotatePic(x, y, w, h, image->sl, image->tl, image->sh, image->th,
+                        angle, pivot_x, pivot_y, color, image);
+}
+
+void R_DrawKeepAspectPic(int x, int y, int w, int h, color_t color, qhandle_t pic)
+{
+    const image_t *image = IMG_ForHandle(pic);
+
     if (image->flags & IF_SCRAP) {
-        R_DrawStretchPic(x, y, w, h, pic);
+        R_DrawStretchPic(x, y, w, h, color, pic);
         return;
     }
 
@@ -222,25 +346,25 @@ void R_DrawKeepAspectPic(int x, int y, int w, int h, qhandle_t pic)
     float s = (1.0f - scale_w / scale) * 0.5f;
     float t = (1.0f - scale_h / scale) * 0.5f;
 
-    GL_StretchPic(x, y, w, h, s, t, 1.0f - s, 1.0f - t, draw.colors[0].u32, image);
+    GL_StretchPic(x, y, w, h, s, t, 1.0f - s, 1.0f - t, color, image);
 }
 
-void R_DrawPic(int x, int y, qhandle_t pic)
+void R_DrawPic(int x, int y, color_t color, qhandle_t pic)
 {
-    image_t *image = IMG_ForHandle(pic);
+    const image_t *image = IMG_ForHandle(pic);
 
     GL_StretchPic(x, y, image->width, image->height,
-                  image->sl, image->tl, image->sh, image->th, draw.colors[0].u32, image);
+                  image->sl, image->tl, image->sh, image->th, color, image);
 }
 
 void R_DrawStretchRaw(int x, int y, int w, int h)
 {
-    _GL_StretchPic(x, y, w, h, 0, 0, 1, 1, U32_WHITE, TEXNUM_RAW, 0);
+    GL_StretchPic_(x, y, w, h, 0, 0, 1, 1, COLOR_WHITE, TEXNUM_RAW, 0);
 }
 
 void R_UpdateRawPic(int pic_w, int pic_h, const uint32_t *pic)
 {
-    GL_ForceTexture(0, TEXNUM_RAW);
+    GL_ForceTexture(TMU_TEXTURE, TEXNUM_RAW);
     qglTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, pic_w, pic_h, 0, GL_RGBA, GL_UNSIGNED_BYTE, pic);
 }
 
@@ -249,121 +373,214 @@ void R_UpdateRawPic(int pic_w, int pic_h, const uint32_t *pic)
 void R_TileClear(int x, int y, int w, int h, qhandle_t pic)
 {
     GL_StretchPic(x, y, w, h, x * DIV64, y * DIV64,
-                  (x + w) * DIV64, (y + h) * DIV64, U32_WHITE, IMG_ForHandle(pic));
+                  (x + w) * DIV64, (y + h) * DIV64, COLOR_WHITE, IMG_ForHandle(pic));
 }
 
 void R_DrawFill8(int x, int y, int w, int h, int c)
 {
     if (!w || !h)
         return;
-    _GL_StretchPic(x, y, w, h, 0, 0, 1, 1, d_8to24table[c & 0xff], TEXNUM_WHITE, 0);
+    GL_StretchPic_(x, y, w, h, 0, 0, 1, 1, COLOR_U32(d_8to24table[c & 0xff]), TEXNUM_WHITE, 0);
 }
 
-void R_DrawFill32(int x, int y, int w, int h, uint32_t color)
+void R_DrawFill32(int x, int y, int w, int h, color_t color)
 {
     if (!w || !h)
         return;
-    _GL_StretchPic(x, y, w, h, 0, 0, 1, 1, color, TEXNUM_WHITE, 0);
+    GL_StretchPic_(x, y, w, h, 0, 0, 1, 1, color, TEXNUM_WHITE, 0);
 }
 
-static inline void draw_char(int x, int y, int flags, int c, image_t *image)
+static inline void draw_char(int x, int y, int w, int h, int flags, int c, color_t color, const image_t *image)
 {
     float s, t;
 
-    if ((c & 127) == 32) {
+    if ((c & 127) == 32)
         return;
-    }
 
-    if (flags & UI_ALTCOLOR) {
+    if (flags & UI_ALTCOLOR)
         c |= 0x80;
-    }
-    if (flags & UI_XORCOLOR) {
+
+    if (flags & UI_XORCOLOR)
         c ^= 0x80;
-    }
 
     s = (c & 15) * 0.0625f;
     t = (c >> 4) * 0.0625f;
 
-    if (gl_fontshadow->integer > 0 && c != 0x83) {
-        uint32_t black = MakeColor(0, 0, 0, draw.colors[0].u8[3]);
+    if (flags & UI_DROPSHADOW && c != 0x83) {
+        color_t black = COLOR_A(color.a);
 
-        GL_StretchPic(x + 1, y + 1, CHAR_WIDTH, CHAR_HEIGHT, s, t,
+        GL_StretchPic(x + 1, y + 1, w, h, s, t,
                       s + 0.0625f, t + 0.0625f, black, image);
 
         if (gl_fontshadow->integer > 1)
-            GL_StretchPic(x + 2, y + 2, CHAR_WIDTH, CHAR_HEIGHT, s, t,
+            GL_StretchPic(x + 2, y + 2, w, h, s, t,
                           s + 0.0625f, t + 0.0625f, black, image);
     }
 
-    GL_StretchPic(x, y, CHAR_WIDTH, CHAR_HEIGHT, s, t,
-                  s + 0.0625f, t + 0.0625f, draw.colors[c >> 7].u32, image);
+    if (c >> 7)
+        color = COLOR_SETA_U8(COLOR_WHITE, color.a);
+
+    GL_StretchPic(x, y, w, h, s, t,
+                  s + 0.0625f, t + 0.0625f, color, image);
 }
 
-void R_DrawChar(int x, int y, int flags, int c, qhandle_t font)
+void R_DrawChar(int x, int y, int flags, int c, color_t color, qhandle_t font)
 {
-    draw_char(x, y, flags, c & 255, IMG_ForHandle(font));
+    if (gl_fontshadow->integer > 0)
+        flags |= UI_DROPSHADOW;
+
+    draw_char(x, y, CHAR_WIDTH, CHAR_HEIGHT, flags, c & 255, color, IMG_ForHandle(font));
 }
 
-int R_DrawString(int x, int y, int flags, size_t maxlen, const char *s, qhandle_t font)
+void R_DrawStretchChar(int x, int y, int w, int h, int flags, int c, color_t color, qhandle_t font)
 {
-    image_t *image = IMG_ForHandle(font);
+    draw_char(x, y, w, h, flags, c & 255, color, IMG_ForHandle(font));
+}
+
+int R_DrawString(int x, int y, int flags, size_t maxlen, const char *s, color_t color, qhandle_t font)
+{
+    const image_t *image = IMG_ForHandle(font);
+
+    if (gl_fontshadow->integer > 0)
+        flags |= UI_DROPSHADOW;
+
+    int sx = x;
 
     while (maxlen-- && *s) {
         byte c = *s++;
-        draw_char(x, y, flags, c, image);
+
+        if ((flags & UI_MULTILINE) && c == '\n') {
+            y += CHAR_HEIGHT + (1.0 / draw.scale);
+            x = sx;
+            continue;
+        }
+
+        draw_char(x, y, CHAR_WIDTH, CHAR_HEIGHT, flags, c, color, image);
         x += CHAR_WIDTH;
     }
 
     return x;
 }
 
-#if USE_DEBUG
+static inline int draw_kfont_char(int x, int y, int scale, int flags, uint32_t codepoint, color_t color, const kfont_t *kfont)
+{
+    const kfont_char_t *ch = SCR_KFontLookup(kfont, codepoint);
+
+    if (!ch)
+        return 0;
+    
+    image_t *image = IMG_ForHandle(kfont->pic);
+
+    float s = ch->x * kfont->sw;
+    float t = ch->y * kfont->sh;
+    
+    float sw = ch->w * kfont->sw;
+    float sh = ch->h * kfont->sh;
+
+    int w = ch->w * scale;
+    int h = ch->h * scale;
+
+    int shadow_offset = 0;
+
+    if ((flags & UI_DROPSHADOW) || gl_fontshadow->integer > 0) {
+        shadow_offset = (1 * scale);
+        
+        color_t black = COLOR_A(color.a);
+
+        GL_StretchPic(x + shadow_offset, y + shadow_offset, w, h, s, t,
+                      s + sw, t + sh, black, image);
+
+        if (gl_fontshadow->integer > 1)
+            GL_StretchPic(x + (shadow_offset * 2), y + (shadow_offset * 2), w, h, s, t,
+                          s + sw, t + sh, black, image);
+    }
+
+    GL_StretchPic(x, y, w, h, s, t,
+                  s + sw, t + sh, color, image);
+
+    return ch->w * scale;
+}
+
+int R_DrawKFontChar(int x, int y, int scale, int flags, uint32_t codepoint, color_t color, const kfont_t *kfont)
+{
+    return draw_kfont_char(x, y, scale, flags, codepoint, color, kfont);
+}
+
+const kfont_char_t *SCR_KFontLookup(const kfont_t *kfont, uint32_t codepoint)
+{
+    if (codepoint < KFONT_ASCII_MIN || codepoint > KFONT_ASCII_MAX)
+        return NULL;
+
+    const kfont_char_t *ch = &kfont->chars[codepoint - KFONT_ASCII_MIN];
+
+    if (!ch->w)
+        return NULL;
+
+    return ch;
+}
+
+void SCR_LoadKFont(kfont_t *font, const char *filename)
+{
+    memset(font, 0, sizeof(*font));
+
+    char *buffer;
+
+    if (FS_LoadFile(filename, (void **) &buffer) < 0)
+        return;
+
+    const char *data = buffer;
+
+    while (true) {
+        const char *token = COM_Parse(&data);
+
+        if (!*token)
+            break;
+
+        if (!strcmp(token, "texture")) {
+            token = COM_Parse(&data);
+            font->pic = R_RegisterFont(va("/%s", token));
+        } else if (!strcmp(token, "unicode")) {
+        } else if (!strcmp(token, "mapchar")) {
+            token = COM_Parse(&data);
+
+            while (true) {
+                token = COM_Parse(&data);
+
+                if (!strcmp(token, "}"))
+                    break;
+
+                uint32_t codepoint = strtoul(token, NULL, 10);
+                uint32_t x, y, w, h;
+                
+                x = strtoul(COM_Parse(&data), NULL, 10);
+                y = strtoul(COM_Parse(&data), NULL, 10);
+                w = strtoul(COM_Parse(&data), NULL, 10);
+                h = strtoul(COM_Parse(&data), NULL, 10);
+                COM_Parse(&data);
+
+                codepoint -= KFONT_ASCII_MIN;
+
+                if (codepoint < KFONT_ASCII_MAX) {
+                    font->chars[codepoint].x = x;
+                    font->chars[codepoint].y = y;
+                    font->chars[codepoint].w = w;
+                    font->chars[codepoint].h = h;
+
+                    font->line_height = max(font->line_height, h);
+                }
+            }
+        }
+    }
+    
+    font->sw = 1.0f / IMG_ForHandle(font->pic)->width;
+    font->sh = 1.0f / IMG_ForHandle(font->pic)->height;
+
+    FS_FreeFile(buffer);
+}
 
 qhandle_t r_charset;
 
-static void Draw_Stringf(int x, int y, const char *fmt, ...)
-{
-    va_list argptr;
-    char buffer[MAX_STRING_CHARS];
-
-    va_start(argptr, fmt);
-    Q_vsnprintf(buffer, sizeof(buffer), fmt, argptr);
-    va_end(argptr);
-
-    R_DrawString(x, y, 0, -1, buffer, r_charset);
-}
-
-void Draw_Stats(void)
-{
-    int x = 10, y = 10;
-
-    R_SetScale(1.0f / get_auto_scale());
-    R_DrawFill8(8, 8, 25*8, 21*10+2, 4);
-
-    Draw_Stringf(x, y, "Nodes visible  : %i", c.nodesVisible); y += 10;
-    Draw_Stringf(x, y, "Nodes culled   : %i", c.nodesCulled); y += 10;
-    Draw_Stringf(x, y, "Nodes drawn    : %i", c.nodesDrawn); y += 10;
-    Draw_Stringf(x, y, "Leaves drawn   : %i", c.leavesDrawn); y += 10;
-    Draw_Stringf(x, y, "Faces drawn    : %i", c.facesDrawn); y += 10;
-    Draw_Stringf(x, y, "Faces culled   : %i", c.facesCulled); y += 10;
-    Draw_Stringf(x, y, "Boxes culled   : %i", c.boxesCulled); y += 10;
-    Draw_Stringf(x, y, "Spheres culled : %i", c.spheresCulled); y += 10;
-    Draw_Stringf(x, y, "RtBoxes culled : %i", c.rotatedBoxesCulled); y += 10;
-    Draw_Stringf(x, y, "Tris drawn     : %i", c.trisDrawn); y += 10;
-    Draw_Stringf(x, y, "Tex switches   : %i", c.texSwitches); y += 10;
-    Draw_Stringf(x, y, "Tex uploads    : %i", c.texUploads); y += 10;
-    Draw_Stringf(x, y, "LM texels      : %i", c.lightTexels); y += 10;
-    Draw_Stringf(x, y, "Batches drawn  : %i", c.batchesDrawn); y += 10;
-    Draw_Stringf(x, y, "Faces / batch  : %.1f", c.batchesDrawn ? (float)c.facesDrawn / c.batchesDrawn : 0.0f); y += 10;
-    Draw_Stringf(x, y, "Tris / batch   : %.1f", c.batchesDrawn ? (float)c.facesTris / c.batchesDrawn : 0.0f); y += 10;
-    Draw_Stringf(x, y, "2D batches     : %i", c.batchesDrawn2D); y += 10;
-    Draw_Stringf(x, y, "Total entities : %i", glr.fd.num_entities); y += 10;
-    Draw_Stringf(x, y, "Total dlights  : %i", glr.fd.num_dlights); y += 10;
-    Draw_Stringf(x, y, "Total particles: %i", glr.fd.num_particles); y += 10;
-    Draw_Stringf(x, y, "Uniform uploads: %i", c.uniformUploads); y += 10;
-
-    R_SetScale(1.0f);
-}
+#if USE_DEBUG
 
 void Draw_Lightmaps(void)
 {
@@ -382,16 +599,16 @@ void Draw_Lightmaps(void)
         for (int j = 0; j < rows; j++) {
             int k = j * cols + i;
             if (k < lm.nummaps)
-                _GL_StretchPic(block * i, block * j, block, block,
-                               0, 0, 1, 1, U32_WHITE, lm.texnums[k], 0);
+                GL_StretchPic_(block * i, block * j, block, block,
+                               0, 0, 1, 1, COLOR_WHITE, lm.texnums[k], 0);
         }
     }
 }
 
 void Draw_Scrap(void)
 {
-    _GL_StretchPic(0, 0, 256, 256,
-                   0, 0, 1, 1, U32_WHITE, TEXNUM_SCRAP, IF_PALETTED | IF_TRANSPARENT);
+    GL_StretchPic_(0, 0, 256, 256,
+                   0, 0, 1, 1, COLOR_WHITE, TEXNUM_SCRAP, IF_PALETTED | IF_TRANSPARENT);
 }
 
 #endif

@@ -17,6 +17,7 @@ with this program; if not, write to the Free Software Foundation, Inc.,
 */
 
 #include "server.h"
+#include "server/nav.h"
 
 server_static_t svs;                // persistant server info
 server_t        sv;                 // local server
@@ -34,26 +35,22 @@ void SV_ClientReset(client_t *client)
     client->frames_nodelta = 0;
     client->send_delta = 0;
     client->suppress_count = 0;
+    client->next_entity = 0;
     memset(&client->lastcmd, 0, sizeof(client->lastcmd));
 }
 
-static void set_frame_time(void)
+static void set_frame_time(int rate, bool override)
 {
-#if USE_FPS
-    if (g_features->integer & GMF_VARIABLE_FPS)
-        sv.frametime = Com_ComputeFrametime(sv_fps->integer);
-    else
-        sv.frametime = Com_ComputeFrametime(BASE_FRAMERATE);
+    sv.framerate = rate;
+    sv.frametime = Com_ComputeFrametime(sv.framerate);
 
-    sv.framerate = sv.frametime.div * BASE_FRAMERATE;
-
-    Cvar_SetInteger(sv_fps, sv.framerate, FROM_CODE);
-#endif
+    if (!override)
+        Cvar_SetInteger(sv_fps, sv.framerate, FROM_CODE);
 }
 
 static void resolve_masters(void)
 {
-#if !USE_CLIENT
+#if USE_SERVER
     time_t now = time(NULL);
 
     for (int i = 0; i < MAX_MASTERS; i++) {
@@ -107,9 +104,12 @@ void SV_SpawnServer(const mapcmd_t *cmd)
     client_t    *client;
 
     SCR_BeginLoadingPlaque();           // for local system
+    R_ClearDebugLines();
 
     Com_Printf("------- Server Initialization -------\n");
     Com_Printf("SpawnServer: %s\n", cmd->server);
+
+    Q_assert(cmd->state >= ss_game);
 
     // everyone needs to reconnect
     FOR_EACH_CLIENT(client) {
@@ -122,24 +122,34 @@ void SV_SpawnServer(const mapcmd_t *cmd)
 
     // free current level
     CM_FreeMap(&sv.cm);
+    Nav_Unload();
 
     // wipe the entire per-level structure
     memset(&sv, 0, sizeof(sv));
-    sv.spawncount = Q_rand() & 0x7fffffff;
+    sv.spawncount = Q_rand() & INT_MAX;
 
     // set legacy spawncounts
     FOR_EACH_CLIENT(client) {
         client->spawncount = sv.spawncount;
     }
 
-    // reset entity counter
-    svs.next_entity = 0;
-
     // set framerate parameters
-    set_frame_time();
+    if (svs.game_type == Q2PROTO_GAME_RERELEASE) {
+        // configured tick rate
+        set_frame_time(sv_fps->integer, false);
+    } else {
+        // Force frame rate to 10Hz for "old" games
+    #if USE_FPS
+        // (unless they support variable FPS)
+        if (g_features->integer & GMF_VARIABLE_FPS) {
+            set_frame_time(sv_fps->integer, false);
+        } else
+    #endif
+        set_frame_time(BASE_FRAMERATE, true);
+    }
 
     // save name for levels that don't set message
-    Q_strlcpy(sv.configstrings[CS_NAME], cmd->server, MAX_QPATH);
+    Q_strlcpy(sv.configstrings[CS_NAME], cmd->server, CS_MAX_STRING_LENGTH);
     Q_strlcpy(sv.name, cmd->server, sizeof(sv.name));
     Q_strlcpy(sv.mapcmd, cmd->buffer, sizeof(sv.mapcmd));
 
@@ -153,6 +163,7 @@ void SV_SpawnServer(const mapcmd_t *cmd)
 
     if (cmd->state == ss_game) {
         sv.cm = cmd->cm;
+        Nav_Load(cmd->server);
         sprintf(sv.configstrings[svs.csr.mapchecksum], "%d", sv.cm.checksum);
 
         // model indices 0 and 255 are reserved
@@ -160,7 +171,7 @@ void SV_SpawnServer(const mapcmd_t *cmd)
             Com_Error(ERR_DROP, "Too many inline models");
 
         // set inline model names
-        Q_concat(sv.configstrings[svs.csr.models + 1], MAX_QPATH, "maps/", cmd->server, ".bsp");
+        Q_concat(sv.configstrings[svs.csr.models + 1], CS_MAX_STRING_LENGTH, "maps/", cmd->server, ".bsp");
         for (i = 1, j = 2; i < sv.cm.cache->nummodels; i++, j++) {
             if (j == MODELINDEX_PLAYER)
                 j++;    // skip reserved index
@@ -189,8 +200,8 @@ void SV_SpawnServer(const mapcmd_t *cmd)
     ge->SpawnEntities(sv.name, sv.cm.entitystring, cmd->spawnpoint);
 
     // run two frames to allow everything to settle
-    ge->RunFrame(); sv.framenum++;
-    ge->RunFrame(); sv.framenum++;
+    for (i = 0; i < 2; i++, sv.framenum++)
+        ge->RunFrame(false);
 
     // make sure maxclients string is correct
     sprintf(sv.configstrings[svs.csr.maxclients], "%d", sv_maxclients->integer);
@@ -207,7 +218,7 @@ void SV_SpawnServer(const mapcmd_t *cmd)
     // set serverinfo variable
     SV_InfoSet("mapname", sv.name);
     SV_InfoSet("port", net_port->string);
-    SV_InfoSet("protocol", svs.csr.extended ? "36" : "34");
+    SV_InfoSet("protocol", STRINGIFY(PROTOCOL_VERSION_RERELEASE));
 
     Cvar_Set("sv_paused", "0");
     Cvar_Set("timedemo", "0");
@@ -221,54 +232,89 @@ void SV_SpawnServer(const mapcmd_t *cmd)
     SV_BroadcastCommand("reconnect\n");
 
     Com_Printf("-------------------------------------\n");
+
+#if USE_CLIENT
+    Cbuf_Defer(&cmd_buffer);
+#endif
 }
 
-static bool check_server(mapcmd_t *cmd, const char *server, bool nextserver)
+static server_state_t get_server_state(const char *s)
 {
-    char        expanded[MAX_QPATH];
-    char        *s, *ch;
-    int         ret = Q_ERR(ENAMETOOLONG);
+    s = COM_FileExtension(s);
 
-    // copy it off to keep original mapcmd intact
+    if (!Q_stricmp(s, ".pcx"))
+        return ss_pic;
+
+    if (!Q_stricmp(s, ".cin"))
+        return ss_cinematic;
+
+    if (!Q_stricmp(s, ".dm2"))
+        return ss_demo;
+
+    return ss_game;
+}
+
+static bool parse_and_check_server(mapcmd_t *cmd, const char *server, bool nextserver)
+{
+    char    expanded[MAX_QPATH], *ch;
+    int     ret = Q_ERR(ENAMETOOLONG);
+
+    // copy it off
     Q_strlcpy(cmd->server, server, sizeof(cmd->server));
-    s = cmd->server;
 
     // if there is a $, use the remainder as a spawnpoint
-    ch = strchr(s, '$');
-    if (ch) {
-        *ch = 0;
-        cmd->spawnpoint = ch + 1;
-    } else {
-        cmd->spawnpoint = s + strlen(s);
-    }
+    ch = Q_strchrnul(cmd->server, '$');
+    if (*ch)
+        *ch++ = 0;
+    cmd->spawnpoint = ch;
 
     // now expand and try to load the map
-    if (!COM_CompareExtension(s, ".pcx")) {
-        if (Q_concat(expanded, sizeof(expanded), "pics/", s) < sizeof(expanded)) {
+    server_state_t state = get_server_state(cmd->server);
+    switch (state) {
+    case ss_pic:
+        if (Q_concat(expanded, sizeof(expanded), "pics/", cmd->server) < sizeof(expanded))
             ret = COM_DEDICATED ? Q_ERR_SUCCESS : FS_LoadFile(expanded, NULL);
-        }
-        cmd->state = ss_pic;
-    } else if (!COM_CompareExtension(s, ".cin")) {
+        break;
+
+    case ss_cinematic:
         if (!sv_cinematics->integer && nextserver)
             return false;   // skip it
-        if (Q_concat(expanded, sizeof(expanded), "video/", s) < sizeof(expanded)) {
+        if (Q_concat(expanded, sizeof(expanded), "video/", cmd->server) < sizeof(expanded))
             ret = SCR_CheckForCinematic(expanded);
-        }
-        cmd->state = ss_cinematic;
-    } else {
-        CM_LoadOverrides(&cmd->cm, cmd->server, sizeof(cmd->server));
-        if (Q_concat(expanded, sizeof(expanded), "maps/", s, ".bsp") < sizeof(expanded)) {
+        break;
+
+    case ss_demo:
+        if (!sv_cinematics->integer && nextserver)
+            return false;       // skip it
+        if (Q_concat(expanded, sizeof(expanded), "demos/", cmd->server) >= sizeof(expanded))
+            break;
+        ret = Q_ERR(ENOSYS);    // only works if running a client
+#if USE_CLIENT
+        if (dedicated->integer || cmd->loadgame)
+            break;              // not supported
+        ret = FS_LoadFile(expanded, NULL);
+        if (ret == Q_ERR(EFBIG))
+            ret = Q_ERR_SUCCESS;
+#endif
+        break;
+
+    default:
+        CM_LoadOverrides(&cmd->cm, cmd->server, sizeof(cmd->server));   // may override server!
+        if (Q_concat(expanded, sizeof(expanded), "maps/", cmd->server, ".bsp") < sizeof(expanded))
             ret = CM_LoadMap(&cmd->cm, expanded);
+        if (ret < 0) {
+            CM_FreeMap(&cmd->cm);   // free entstring if overridden
+            Nav_Unload();
         }
-        cmd->state = ss_game;
+        break;
     }
 
     if (ret < 0) {
         Com_Printf("Couldn't load %s: %s\n", expanded, BSP_ErrorString(ret));
-        CM_FreeMap(&cmd->cm);   // free entstring if overridden
         return false;
     }
 
+    cmd->state = state;
     return true;
 }
 
@@ -309,7 +355,7 @@ bool SV_ParseMapCmd(mapcmd_t *cmd)
             *ch = 0;
 
         // see if map exists and can be loaded
-        if (check_server(cmd, s, ch)) {
+        if (parse_and_check_server(cmd, s, ch)) {
             if (ch)
                 Cvar_Set("nextserver", va("gamemap \"!%s\"", ch + 1));
             else
@@ -344,7 +390,7 @@ If mvd_spawn is non-zero, load the built-in MVD game module.
 */
 void SV_InitGame(unsigned mvd_spawn)
 {
-    int     i, entnum, max_packet_entities;
+    int     i, entnum;
     edict_t *ent;
     client_t *client;
 
@@ -355,8 +401,10 @@ void SV_InitGame(unsigned mvd_spawn)
         // make sure the client is down
         CL_Disconnect(ERR_RECONNECT);
         SCR_BeginLoadingPlaque();
+        R_ClearDebugLines();
 
         CM_FreeMap(&sv.cm);
+        Nav_Unload();
         memset(&sv, 0, sizeof(sv));
 
 #if USE_FPS
@@ -368,7 +416,10 @@ void SV_InitGame(unsigned mvd_spawn)
     // get any latched variable changes (maxclients, etc)
     Cvar_GetLatchedVars();
 
-#if !USE_CLIENT
+    // We need the time values before the game is loaded
+    set_frame_time(sv_fps->integer, false);
+
+#if USE_SERVER
     Cvar_Reset(sv_recycle);
 #endif
 
@@ -427,6 +478,9 @@ void SV_InitGame(unsigned mvd_spawn)
 
     svs.csr = cs_remap_old;
 
+    // set up default pmove parameters
+    PmoveInit(&svs.pmp);
+
     // init game
 #if USE_MVD_CLIENT
     if (mvd_spawn) {
@@ -442,11 +496,6 @@ void SV_InitGame(unsigned mvd_spawn)
         SV_CheckForEnhancedSavegames();
         SV_MvdPostInit();
     }
-
-    // allocate packet entities
-    max_packet_entities = svs.csr.extended ? MAX_PACKET_ENTITIES : MAX_PACKET_ENTITIES_OLD;
-    svs.num_entities = sv_maxclients->integer * max_packet_entities * UPDATE_BACKUP;
-    svs.entities = SV_Mallocz(sizeof(svs.entities[0]) * svs.num_entities);
 
     // send heartbeat very soon
     svs.last_heartbeat = -(HEARTBEAT_SECONDS - 5) * 1000;

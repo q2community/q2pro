@@ -37,10 +37,12 @@ static ogg_state_t  ogg;
 static cvar_t   *ogg_enable;
 static cvar_t   *ogg_volume;
 static cvar_t   *ogg_shuffle;
+static cvar_t   *ogg_menu_track;
 
 static void     **tracklist;
 static int      trackcount;
 static int      trackindex;
+static char     currenttrack[MAX_QPATH];
 
 static char     extensions[MAX_QPATH];
 static int      supported;
@@ -71,7 +73,7 @@ static void init_formats(void)
     Com_DPrintf("Supported music formats: %#x\n", supported);
 }
 
-static void ogg_stop(void)
+static void ogg_stop(bool clear_track)
 {
     avcodec_free_context(&ogg.dec_ctx);
     avformat_close_input(&ogg.fmt_ctx);
@@ -81,6 +83,9 @@ static void ogg_stop(void)
     swr_free(&ogg.swr_ctx);
 
     memset(&ogg, 0, sizeof(ogg));
+
+    if (clear_track)
+        currenttrack[0] = '\0';
 }
 
 static AVFormatContext *ogg_open(const char *name, bool autoplay)
@@ -155,7 +160,7 @@ done:
     return fmt_ctx;
 }
 
-static bool ogg_play_(void)
+static bool ogg_try_play(void)
 {
     AVStream        *st;
     const AVCodec   *dec;
@@ -229,8 +234,8 @@ static void ogg_play(AVFormatContext *fmt_ctx)
     Q_assert(!ogg.fmt_ctx);
     ogg.fmt_ctx = fmt_ctx;
 
-    if (!ogg_play_())
-        ogg_stop();
+    if (!ogg_try_play())
+        ogg_stop(true);
 }
 
 static void shuffle(void)
@@ -241,21 +246,20 @@ static void shuffle(void)
     }
 }
 
-void OGG_Play(void)
+static void ogg_play_internal(const char *s, bool force)
 {
-    ogg_stop();
-
     if (!s_started)
         return;
 
     if (!ogg_enable->integer)
         return;
 
-    const char *s = cl.configstrings[CS_CDTRACK];
-    if (!*s || !strcmp(s, "0"))
+    if (!*s || !strcmp(s, "0")) {
+        ogg_stop(true);
         return;
+    }
 
-    if (ogg_shuffle->integer && trackcount) {
+    if (!force && ogg_shuffle->integer && trackcount) {
         if (trackindex == 0)
             shuffle();
         s = tracklist[trackindex];
@@ -264,15 +268,38 @@ void OGG_Play(void)
         s = va("track%02d", Q_atoi(s));
     }
 
+    // don't restart the current track if we're
+    // currently playing it
+    if (ogg.fmt_ctx && strcmp(s, currenttrack) == 0) {
+        return;
+    }
+    
+    Q_strlcpy(currenttrack, s, sizeof(currenttrack));
+
+    ogg_stop(false);
+
     ogg_play(ogg_open(s, true));
+
+    if (s_api)
+        s_api->drop_raw_samples();
 }
 
-void OGG_Stop(void)
+void OGG_Play(void)
 {
-    ogg_stop();
+    ogg_play_internal(cl.configstrings[CS_CDTRACK], false);
+}
 
-    if (s_started)
-        s_api.drop_raw_samples();
+void OGG_PlayMenu(void)
+{
+    ogg_play_internal(ogg_menu_track->string, true);
+}
+
+void OGG_Stop(bool clear_track)
+{
+    ogg_stop(clear_track);
+
+    if (s_api)
+        s_api->drop_raw_samples();
 }
 
 static int read_packet(AVPacket *pkt)
@@ -287,7 +314,7 @@ static int read_packet(AVPacket *pkt)
     }
 }
 
-static int decode_frame_(void)
+static int decode_frame(void)
 {
     AVCodecContext *dec = ogg.dec_ctx;
     AVPacket *pkt = ogg.pkt;
@@ -312,9 +339,9 @@ static int decode_frame_(void)
     }
 }
 
-static bool decode_frame(void)
+static bool decode_next_frame(void)
 {
-    int ret = decode_frame_();
+    int ret = decode_frame();
     if (ret >= 0)
         return true;
 
@@ -324,9 +351,11 @@ static bool decode_frame(void)
         Com_EPrintf("Error decoding audio: %s\n", av_err2str(ret));
 
     // play next file
+    // clear current track so it actually restarts
+    currenttrack[0] = '\0';
     OGG_Play();
 
-    return ogg.dec_ctx && decode_frame_() >= 0;
+    return ogg.dec_ctx && decode_frame() >= 0;
 }
 
 static int convert_samples(AVFrame *in)
@@ -338,7 +367,10 @@ static int convert_samples(AVFrame *in)
     if (out->format < 0)
         return 0;
 
-    out->nb_samples = s_api.need_raw_samples();
+    // get available free space
+    out->nb_samples = s_api->need_raw_samples();
+    Q_assert((unsigned)out->nb_samples <= MAX_RAW_SAMPLES);
+
     ret = swr_convert_frame(ogg.swr_ctx, out, in);
     if (ret < 0)
         return ret;
@@ -347,10 +379,10 @@ static int convert_samples(AVFrame *in)
 
     Com_DDDPrintf("%d raw samples\n", out->nb_samples);
 
-    if (!s_api.raw_samples(out->nb_samples, out->sample_rate, 2,
-                           out->ch_layout.nb_channels,
-                           out->data[0], ogg_volume->value))
-        s_api.drop_raw_samples();
+    if (!s_api->raw_samples(out->nb_samples, out->sample_rate, 2,
+                            out->ch_layout.nb_channels,
+                            out->data[0], ogg_volume->value))
+        s_api->drop_raw_samples();
 
     return 1;
 }
@@ -382,12 +414,12 @@ void OGG_Update(void)
     if (!s_started || !s_active || !ogg.dec_ctx)
         return;
 
-    while (s_api.need_raw_samples() > 0) {
+    while (s_api->need_raw_samples() > 0) {
         int ret = convert_samples(NULL);
 
         // if swr buffer is empty, decode more input
         if (ret == 0) {
-            if (!decode_frame())
+            if (!decode_next_frame())
                 break;
 
             // now that we have a frame, configure output
@@ -406,7 +438,7 @@ void OGG_Update(void)
 
         if (ret < 0) {
             Com_EPrintf("Error converting audio: %s\n", av_err2str(ret));
-            OGG_Stop();
+            OGG_Stop(false);
             break;
         }
     }
@@ -469,32 +501,32 @@ bool OGG_Load(sizebuf_t *sz)
 
     const AVInputFormat *fmt = av_find_input_format("ogg");
     if (!fmt) {
-        Com_DPrintf("Ogg input format not found\n");
+        Com_SetLastError("Ogg input format not found");
         return false;
     }
 
     const AVCodec *dec = avcodec_find_decoder(AV_CODEC_ID_VORBIS);
     if (!dec) {
-        Com_DPrintf("Vorbis decoder not found\n");
+        Com_SetLastError("Vorbis decoder not found");
         return false;
     }
 
     fmt_ctx = avformat_alloc_context();
     if (!fmt_ctx) {
-        Com_DPrintf("Failed to allocate format context\n");
+        Com_SetLastError("Failed to allocate format context");
         return false;
     }
 
     avio_ctx_buffer = av_malloc(avio_ctx_buffer_size);
     if (!avio_ctx_buffer) {
-        Com_DPrintf("Failed to allocate avio buffer\n");
+        Com_SetLastError("Failed to allocate avio buffer");
         goto fail;
     }
 
     avio_ctx = avio_alloc_context(avio_ctx_buffer, avio_ctx_buffer_size,
                                   0, sz, sz_read_packet, NULL, sz_seek);
     if (!avio_ctx) {
-        Com_DPrintf("Failed to allocate avio context\n");
+        Com_SetLastError("Failed to allocate avio context");
         goto fail;
     }
 
@@ -502,51 +534,51 @@ bool OGG_Load(sizebuf_t *sz)
 
     ret = avformat_open_input(&fmt_ctx, NULL, fmt, NULL);
     if (ret < 0) {
-        Com_DPrintf("Couldn't open %s: %s\n", s_info.name, av_err2str(ret));
+        Com_SetLastError(av_err2str(ret));
         goto fail;
     }
 
     if (fmt_ctx->nb_streams != 1) {
-        Com_DPrintf("Multiple streams in %s\n", s_info.name);
+        Com_SetLastError("Multiple Ogg streams are not supported");
         goto fail;
     }
 
     st = fmt_ctx->streams[0];
     if (st->codecpar->codec_id != AV_CODEC_ID_VORBIS) {
-        Com_DPrintf("First stream is not Vorbis in %s\n", s_info.name);
+        Com_SetLastError("First stream is not Vorbis");
         goto fail;
     }
 
     if (st->codecpar->ch_layout.nb_channels < 1 || st->codecpar->ch_layout.nb_channels > 2) {
-        Com_DPrintf("%s has bad number of channels\n", s_info.name);
+        Com_SetLastError("Unsupported number of channels");
         goto fail;
     }
 
-    if (st->codecpar->sample_rate < 8000 || st->codecpar->sample_rate > 48000) {
-        Com_DPrintf("%s has bad rate\n", s_info.name);
+    if (st->codecpar->sample_rate < 6000 || st->codecpar->sample_rate > 48000) {
+        Com_SetLastError("Unsupported sample rate");
         goto fail;
     }
 
     if (st->duration < 1 || st->duration > MAX_SFX_SAMPLES) {
-        Com_DPrintf("%s has bad number of samples\n", s_info.name);
+        Com_SetLastError("Unsupported duration");
         goto fail;
     }
 
     dec_ctx = avcodec_alloc_context3(dec);
     if (!dec_ctx) {
-        Com_DPrintf("Failed to allocate codec context\n");
+        Com_SetLastError("Failed to allocate codec context");
         goto fail;
     }
 
     ret = avcodec_parameters_to_context(dec_ctx, st->codecpar);
     if (ret < 0) {
-        Com_DPrintf("Failed to copy codec parameters to decoder context\n");
+        Com_SetLastError("Failed to copy codec parameters to decoder context");
         goto fail;
     }
 
     ret = avcodec_open2(dec_ctx, dec, NULL);
     if (ret < 0) {
-        Com_DPrintf("Failed to open codec\n");
+        Com_SetLastError("Failed to open codec");
         goto fail;
     }
 
@@ -557,7 +589,7 @@ bool OGG_Load(sizebuf_t *sz)
     out = av_frame_alloc();
     swr_ctx = swr_alloc();
     if (!pkt || !frame || !out || !swr_ctx) {
-        Com_DPrintf("Failed to allocate memory\n");
+        Com_SetLastError("Failed to allocate memory");
         goto fail;
     }
 
@@ -567,7 +599,7 @@ bool OGG_Load(sizebuf_t *sz)
 
     ret = av_channel_layout_copy(&out->ch_layout, &dec_ctx->ch_layout);
     if (ret < 0) {
-        Com_DPrintf("Failed to copy channel layout\n");
+        Com_SetLastError("Failed to copy channel layout");
         goto fail;
     }
     out->format = AV_SAMPLE_FMT_S16;
@@ -576,16 +608,14 @@ bool OGG_Load(sizebuf_t *sz)
 
     ret = av_frame_get_buffer(out, 0);
     if (ret < 0) {
-        Com_DPrintf("Failed to allocate audio buffer\n");
+        Com_SetLastError("Failed to allocate audio buffer");
         goto fail;
     }
 
     int64_t nb_samples = st->duration;
 
-    if (out->sample_rate != dec_ctx->sample_rate) {
+    if (out->sample_rate != dec_ctx->sample_rate)
         nb_samples = av_rescale_rnd(st->duration + 2, out->sample_rate, dec_ctx->sample_rate, AV_ROUND_UP) + 2;
-        Q_assert(nb_samples <= INT_MAX >> out->ch_layout.nb_channels);
-    }
 
     int bufsize = nb_samples << out->ch_layout.nb_channels;
     int offset = 0;
@@ -634,7 +664,7 @@ bool OGG_Load(sizebuf_t *sz)
     }
 
     if (ret < 0) {
-        Com_DPrintf("Error decoding %s: %s\n", s_info.name, av_err2str(ret));
+        Com_SetLastError(av_err2str(ret));
         Z_Freep(&s_info.data);
         goto fail;
     }
@@ -659,7 +689,7 @@ fail:
 void OGG_LoadTrackList(void)
 {
     FS_FreeList(tracklist);
-    tracklist = FS_ListFiles("music", extensions, FS_SEARCH_STRIPEXT, &trackcount);
+    tracklist = FS_ListFiles("music", extensions, FS_SEARCH_STRIPEXT | FS_TYPE_REAL, &trackcount);
     trackindex = 0;
 }
 
@@ -684,7 +714,7 @@ static void OGG_Play_f(void)
     if (!fmt_ctx)
         return;
 
-    OGG_Stop();
+    OGG_Stop(false);
 
     ogg_play(fmt_ctx);
 }
@@ -708,11 +738,12 @@ static void OGG_Cmd_c(genctx_t *ctx, int argnum)
         Prompt_AddMatch(ctx, "info");
         Prompt_AddMatch(ctx, "play");
         Prompt_AddMatch(ctx, "stop");
+        Prompt_AddMatch(ctx, "next");
         return;
     }
 
     if (argnum == 2 && !strcmp(Cmd_Argv(1), "play"))
-        FS_File_g("music", extensions, FS_SEARCH_STRIPEXT, ctx);
+        FS_File_g("music", extensions, FS_SEARCH_STRIPEXT | FS_TYPE_REAL, ctx);
 }
 
 static void OGG_Cmd_f(void)
@@ -724,9 +755,11 @@ static void OGG_Cmd_f(void)
     else if (!strcmp(cmd, "play"))
         OGG_Play_f();
     else if (!strcmp(cmd, "stop"))
-        OGG_Stop();
+        OGG_Stop(true);
+    else if (!strcmp(cmd, "next"))
+        OGG_Play();
     else
-        Com_Printf("Usage: %s <info|play|stop>\n", Cmd_Argv(0));
+        Com_Printf("Usage: %s <info|play|stop|next>\n", Cmd_Argv(0));
 }
 
 static void ogg_enable_changed(cvar_t *self)
@@ -736,7 +769,7 @@ static void ogg_enable_changed(cvar_t *self)
     if (self->integer)
         OGG_Play();
     else
-        OGG_Stop();
+        OGG_Stop(true);
 }
 
 static void ogg_volume_changed(cvar_t *self)
@@ -749,6 +782,16 @@ static const cmdreg_t c_ogg[] = {
     { NULL }
 };
 
+void OGG_Restart(void)
+{
+    if (*currenttrack) {
+        ogg_play(ogg_open(currenttrack, true));
+
+        if (s_api)
+            s_api->drop_raw_samples();
+    }
+}
+
 void OGG_Init(void)
 {
     ogg_enable = Cvar_Get("ogg_enable", "1", 0);
@@ -756,17 +799,20 @@ void OGG_Init(void)
     ogg_volume = Cvar_Get("ogg_volume", "1", 0);
     ogg_volume->changed = ogg_volume_changed;
     ogg_shuffle = Cvar_Get("ogg_shuffle", "0", 0);
+    ogg_menu_track = Cvar_Get("ogg_menu_track", "77", 0);
 
     Cmd_Register(c_ogg);
 
     init_formats();
 
     OGG_LoadTrackList();
+
+    OGG_Restart();
 }
 
 void OGG_Shutdown(void)
 {
-    ogg_stop();
+    ogg_stop(false);
 
     FS_FreeList(tracklist);
     tracklist = NULL;

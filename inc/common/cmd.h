@@ -44,6 +44,7 @@ typedef struct cmdbuf_s {
     int         waitCount;
     int         aliasCount; // for detecting runaway loops
     void        (*exec)(struct cmdbuf_s *, const char *);
+    char        defer[MAX_STRING_CHARS]; // will be null terminated
 } cmdbuf_t;
 
 // generic console buffer
@@ -79,6 +80,19 @@ void Cbuf_Execute(cmdbuf_t *buf);
 void Cbuf_Frame(cmdbuf_t *buf);
 // Called once per frame. Decrements waitCount, resets aliasCount.
 
+void Cbuf_Clear(cmdbuf_t *buf);
+// Clears entire buffer text.
+
+// Copy the current remaining contents of the
+// command buffer to a deferred staging area.
+void Cbuf_Defer(cmdbuf_t *buf);
+
+// Run the deferred contents from the buffer.
+void Cbuf_ExecuteDeferred(cmdbuf_t *buf);
+
+// We don't need the deferred contents any more.
+void Cbuf_ClearDeferred(cmdbuf_t *buf);
+
 //===========================================================================
 
 /*
@@ -111,7 +125,7 @@ typedef struct {
     const char *sh, *lo, *help;
 } cmd_option_t;
 
-typedef struct cmdreg_s {
+typedef struct {
     const char      *name;
     xcommand_t      function;
     xcompleter_t    completer;

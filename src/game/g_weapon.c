@@ -35,7 +35,7 @@ static void check_dodge(edict_t *self, vec3_t start, vec3_t dir, int speed)
 
     // easy mode only ducks one quarter the time
     if (skill->value == 0 && random() > 0.25f)
-        return;
+            return;
     VectorMA(start, 8192, dir, end);
     tr = gi.trace(start, NULL, NULL, end, self, MASK_SHOT);
     if ((tr.ent) && (tr.ent->svflags & SVF_MONSTER) && (tr.ent->health > 0) && (tr.ent->monsterinfo.dodge) && infront(tr.ent, self)) {
@@ -634,7 +634,7 @@ void fire_rail(edict_t *self, vec3_t start, vec3_t aimdir, int damage, int kick)
         } else {
             //ZOID--added so rail goes through SOLID_BBOX entities (gibs, etc)
             if (((tr.ent->svflags & SVF_MONSTER) || (tr.ent->client) ||
-                 (tr.ent->solid == SOLID_BBOX)) && (lastfrac + tr.fraction > 0))
+                (tr.ent->solid == SOLID_BBOX)) && (lastfrac + tr.fraction > 0))
                 ignore = tr.ent;
             else
                 ignore = NULL;
@@ -805,7 +805,7 @@ void bfg_think(edict_t *self)
                 gi.WriteByte(4);
                 gi.WritePosition(tr.endpos);
                 gi.WriteDir(tr.plane.normal);
-                gi.WriteByte(self->s.skinnum);
+                gi.WriteByte(0xd0);
                 gi.multicast(tr.endpos, MULTICAST_PVS);
                 break;
             }

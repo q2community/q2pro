@@ -285,7 +285,7 @@ char *UI_GetColumn(char *s, int n)
 UI_CursorInRect
 =================
 */
-bool UI_CursorInRect(vrect_t *rect)
+bool UI_CursorInRect(const vrect_t *rect)
 {
     if (uis.mouseCoords[0] < rect->x) {
         return false;
@@ -302,7 +302,8 @@ bool UI_CursorInRect(vrect_t *rect)
     return true;
 }
 
-void UI_DrawString(int x, int y, int flags, const char *string)
+// nb: all UI strings are drawn at full alpha
+void UI_DrawString(int x, int y, int flags, color_t color, const char *string)
 {
     if ((flags & UI_CENTER) == UI_CENTER) {
         x -= strlen(string) * CHAR_WIDTH / 2;
@@ -310,12 +311,13 @@ void UI_DrawString(int x, int y, int flags, const char *string)
         x -= strlen(string) * CHAR_WIDTH;
     }
 
-    R_DrawString(x, y, flags, MAX_STRING_CHARS, string, uis.fontHandle);
+    R_DrawString(x, y, flags, MAX_STRING_CHARS, string, COLOR_SETA_U8(color, 255), uis.fontHandle);
 }
 
-void UI_DrawChar(int x, int y, int flags, int ch)
+// nb: all UI chars are drawn at full alpha
+void UI_DrawChar(int x, int y, int flags, color_t color, int ch)
 {
-    R_DrawChar(x, y, flags, ch, uis.fontHandle);
+    R_DrawChar(x, y, flags, ch, COLOR_SETA_U8(color, 255), uis.fontHandle);
 }
 
 void UI_StringDimensions(vrect_t *rc, int flags, const char *string)
@@ -337,16 +339,6 @@ void UI_DrawRect8(const vrect_t *rc, int border, int c)
     R_DrawFill8(rc->x + border, rc->y, rc->width - border * 2, border, c);   // top
     R_DrawFill8(rc->x + border, rc->y + rc->height - border, rc->width - border * 2, border, c);   // bottom
 }
-
-#if 0
-void UI_DrawRect32(const vrect_t *rc, int border, uint32_t color)
-{
-    R_DrawFill32(rc->x, rc->y, border, rc->height, color);   // left
-    R_DrawFill32(rc->x + rc->width - border, rc->y, border, rc->height, color);   // right
-    R_DrawFill32(rc->x + border, rc->y, rc->width - border * 2, border, color);   // top
-    R_DrawFill32(rc->x + border, rc->y + rc->height - border, rc->width - border * 2, border, color);   // bottom
-}
-#endif
 
 //=============================================================================
 /* Menu Subsystem */
@@ -422,7 +414,6 @@ void UI_Draw(unsigned realtime)
         return;
     }
 
-    R_ClearColor();
     R_SetScale(uis.scale);
 
     if (1) {
@@ -446,12 +437,13 @@ void UI_Draw(unsigned realtime)
     // draw custom cursor in fullscreen mode
     if (r_config.flags & QVF_FULLSCREEN) {
         R_DrawPic(uis.mouseCoords[0] - uis.cursorWidth / 2,
-                  uis.mouseCoords[1] - uis.cursorHeight / 2, uis.cursorHandle);
+                  uis.mouseCoords[1] - uis.cursorHeight / 2, 
+                  COLOR_WHITE, uis.cursorHandle);
     }
 
     if (ui_debug->integer) {
         UI_DrawString(uis.width - 4, 4, UI_RIGHT,
-                      va("%3i %3i", uis.mouseCoords[0], uis.mouseCoords[1]));
+                      COLOR_WHITE, va("%3i %3i", uis.mouseCoords[0], uis.mouseCoords[1]));
     }
 
     // delay playing the enter sound until after the
@@ -462,7 +454,6 @@ void UI_Draw(unsigned realtime)
         S_StartLocalSound("misc/menu1.wav");
     }
 
-    R_ClearColor();
     R_SetScale(1.0f);
 }
 
@@ -614,9 +605,6 @@ UI_Init
 */
 void UI_Init(void)
 {
-    char buffer[MAX_QPATH];
-    int i;
-
     Cmd_Register(c_ui);
 
     ui_debug = Cvar_Get("ui_debug", "0", 0);
@@ -628,18 +616,20 @@ void UI_Init(void)
     uis.cursorHandle = R_RegisterPic("ch1");
     R_GetPicSize(&uis.cursorWidth, &uis.cursorHeight, uis.cursorHandle);
 
-    for (i = 0; i < NUM_CURSOR_FRAMES; i++) {
-        Q_snprintf(buffer, sizeof(buffer), "m_cursor%d", i);
-        uis.bitmapCursors[i] = R_RegisterPic(buffer);
+    for (int i = 0; i < NUM_CURSOR_FRAMES; i++) {
+        uis.bitmapCursors[i] = R_RegisterPic(va("m_cursor%d", i));
     }
 
-    uis.color.background.u32    = MakeColor(0,   0,   0, 255);
-    uis.color.normal.u32        = MakeColor(15, 128, 235, 100);
-    uis.color.active.u32        = MakeColor(15, 128, 235, 100);
-    uis.color.selection.u32     = MakeColor(15, 128, 235, 100);
-    uis.color.disabled.u32      = MakeColor(127, 127, 127, 255);
+    uis.color.background    = COLOR_RGBA(0,   0,   0,   255);
+    uis.color.normal        = COLOR_RGBA(15,  128, 235, 100);
+    uis.color.active        = COLOR_RGBA(15,  128, 235, 100);
+    uis.color.selection     = COLOR_RGBA(15,  128, 235, 100);
+    uis.color.disabled      = COLOR_RGBA(127, 127, 127, 255);
 
     strcpy(uis.weaponModel, "w_railgun.md2");
+
+    // load mapdb
+    UI_MapDB_Init();
 
     // load custom menus
     UI_LoadScript();
@@ -675,6 +665,8 @@ void UI_Shutdown(void)
     Cmd_Deregister(c_ui);
 
     memset(&uis, 0, sizeof(uis));
+
+    UI_MapDB_Shutdown();
 
     Z_LeakTest(TAG_UI);
 }

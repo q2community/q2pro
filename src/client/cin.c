@@ -245,7 +245,7 @@ static bool SCR_ReadNextFrame(void)
             return false;
 
         for (i = 0, p = palette; i < 256; i++, p += 3)
-            cin.palette[i] = MakeColor(p[0], p[1], p[2], 255);
+            cin.palette[i] = COLOR_U32_RGBA(p[0], p[1], p[2], 255);
     }
 
     // decompress the next frame
@@ -349,7 +349,7 @@ void SCR_DrawCinematic(void)
         if (cin.pic)
             R_DrawStretchRaw(x, y, w, h);
         else if (cin.static_pic)
-            R_DrawStretchPic(x, y, w, h, cin.static_pic);
+            R_DrawStretchPic(x, y, w, h, COLOR_WHITE, cin.static_pic);
     }
 }
 
@@ -475,4 +475,14 @@ int SCR_CheckForCinematic(const char *name)
         ret = Q_ERR_SUCCESS;
 
     return ret;
+}
+
+/*
+==================
+SCR_Cinematic_g
+==================
+*/
+void SCR_Cinematic_g(genctx_t *ctx)
+{
+    FS_File_g("video", ".cin", FS_SEARCH_RECURSIVE | FS_TYPE_REAL, ctx);
 }

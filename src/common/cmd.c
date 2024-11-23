@@ -57,7 +57,13 @@ bind g "impulse 5 ; +attack ; wait ; -attack ; impulse 2"
 static void Cmd_Wait_f(void)
 {
     int count = Q_atoi(Cmd_Argv(1));
-    cmd_current->waitCount += max(count, 1);
+
+    if (cmd_current->waitCount >= 1000) {
+        Com_WPrintf("Runaway wait count\n");
+        return;
+    }
+
+    cmd_current->waitCount += Q_clip(count, 1, 1000 - cmd_current->waitCount);
 }
 
 /*
@@ -198,6 +204,49 @@ void Cbuf_Frame(cmdbuf_t *buf)
 }
 
 /*
+============
+Cbuf_Clear
+============
+*/
+void Cbuf_Clear(cmdbuf_t *buf)
+{
+    buf->cursize = buf->waitCount = buf->aliasCount = 0;
+}
+
+/*
+============
+Cbuf_Clear
+============
+*/
+void Cbuf_Defer(cmdbuf_t *buf)
+{
+    Q_strlcpy(buf->defer, buf->text, buf->cursize);
+    Cbuf_Clear(buf);
+}
+
+/*
+============
+Cbuf_ExecuteDeferred
+============
+*/
+void Cbuf_ExecuteDeferred(cmdbuf_t *buf)
+{
+    Cbuf_AddText(buf, buf->defer);
+    Cbuf_ClearDeferred(buf);
+    Cbuf_Execute(buf);
+}
+
+/*
+============
+Cbuf_ClearDeferred
+============
+*/
+void Cbuf_ClearDeferred(cmdbuf_t *buf)
+{
+    buf->defer[0] = '\0';
+}
+
+/*
 ==============================================================================
 
                         SCRIPT COMMANDS
@@ -212,7 +261,7 @@ void Cbuf_Frame(cmdbuf_t *buf)
 #define FOR_EACH_ALIAS(alias) \
     LIST_FOR_EACH(cmdalias_t, alias, &cmd_alias, listEntry)
 
-typedef struct cmdalias_s {
+typedef struct {
     list_t  hashEntry;
     list_t  listEntry;
     char    *value;
@@ -609,28 +658,28 @@ static void Cmd_If_f(void)
 
     numeric = COM_IsFloat(a) && COM_IsFloat(b);
     if (!strcmp(op, "==")) {
-        matched = numeric ? atof(a) == atof(b) : !strcmp(a, b);
+        matched = numeric ? Q_atof(a) == Q_atof(b) : !strcmp(a, b);
     } else if (!strcmp(op, "!=") || !strcmp(op, "<>")) {
-        matched = numeric ? atof(a) != atof(b) : strcmp(a, b);
+        matched = numeric ? Q_atof(a) != Q_atof(b) : strcmp(a, b);
     } else if (!strcmp(op, "<")) {
         if (!numeric) {
 error:
             Com_Printf("Can't use '%s' with non-numeric expression(s)\n", op);
             return;
         }
-        matched = atof(a) < atof(b);
+        matched = Q_atof(a) < Q_atof(b);
     } else if (!strcmp(op, "<=")) {
         if (!numeric)
             goto error;
-        matched = atof(a) <= atof(b);
+        matched = Q_atof(a) <= Q_atof(b);
     } else if (!strcmp(op, ">")) {
         if (!numeric)
             goto error;
-        matched = atof(a) > atof(b);
+        matched = Q_atof(a) > Q_atof(b);
     } else if (!strcmp(op, ">=")) {
         if (!numeric)
             goto error;
-        matched = atof(a) >= atof(b);
+        matched = Q_atof(a) >= Q_atof(b);
     } else if (!Q_stricmp(op, "isin")) {
         matched = strstr(b, a) != NULL;
     } else if (!Q_stricmp(op, "!isin")) {
@@ -769,7 +818,7 @@ void Cmd_AddMacro(const char *name, xmacro_t function)
 #define FOR_EACH_CMD(cmd) \
     LIST_FOR_EACH(cmd_function_t, cmd, &cmd_functions, listEntry)
 
-typedef struct cmd_function_s {
+typedef struct {
     list_t          hashEntry;
     list_t          listEntry;
 
@@ -1530,8 +1579,11 @@ void Cmd_Command_g(genctx_t *ctx)
 {
     cmd_function_t *cmd;
 
-    FOR_EACH_CMD(cmd)
+    FOR_EACH_CMD(cmd) {
+        if (COM_DEDICATED && !cmd->function)
+            continue;
         Prompt_AddMatch(ctx, cmd->name);
+    }
 }
 
 void Cmd_ExecuteCommand(cmdbuf_t *buf)
@@ -1553,7 +1605,7 @@ void Cmd_ExecuteCommand(cmdbuf_t *buf)
     if (cmd) {
         if (cmd->function) {
             cmd->function();
-        } else if (!CL_ForwardToServer()) {
+        } else if (!COM_DEDICATED && !CL_ForwardToServer()) {
             Com_Printf("Can't \"%s\", not connected\n", cmd_argv[0]);
         }
         return;
@@ -1775,7 +1827,7 @@ static void Cmd_EchoEx_f(void)
     char buffer[MAX_STRING_CHARS], *s;
     bool escapes = false;
     print_type_t level = PRINT_ALL;
-    color_index_t color = COLOR_NONE;
+    color_index_t color = COLOR_INDEX_NONE;
     const char *newline = "\n";
     int c;
 
@@ -1820,7 +1872,7 @@ static void Cmd_EchoEx_f(void)
 
     Com_SetColor(color);
     Com_LPrintf(level, "%s%s", s, newline);
-    Com_SetColor(COLOR_NONE);
+    Com_SetColor(COLOR_INDEX_NONE);
 }
 
 /*
@@ -1841,6 +1893,9 @@ static void Cmd_List_f(void)
     i = total = 0;
     FOR_EACH_CMD(cmd) {
         total++;
+        if (COM_DEDICATED && !cmd->function) {
+            continue;
+        }
         if (filter && !Com_WildCmp(filter, cmd->name)) {
             continue;
         }
@@ -1888,6 +1943,9 @@ static void Cmd_Complete_f(void)
     cmd_function_t *cmd;
     char *name;
     size_t len;
+
+    if (COM_DEDICATED)
+        return;
 
     if (cmd_argc < 2) {
         Com_Printf("Usage: %s <command>", cmd_argv[0]);

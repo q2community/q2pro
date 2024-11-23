@@ -39,7 +39,7 @@ void vectoangles2(const vec3_t value1, vec3_t angles)
             pitch = 270;
     } else {
         if (value1[0])
-            yaw = RAD2DEG(atan2(value1[1], value1[0]));
+            yaw = RAD2DEG(atan2f(value1[1], value1[0]));
         else if (value1[1] > 0)
             yaw = 90;
         else
@@ -49,7 +49,7 @@ void vectoangles2(const vec3_t value1, vec3_t angles)
             yaw += 360;
 
         forward = sqrtf(value1[0] * value1[0] + value1[1] * value1[1]);
-        pitch = RAD2DEG(atan2(value1[2], forward));
+        pitch = RAD2DEG(atan2f(value1[2], forward));
         if (pitch < 0)
             pitch += 360;
     }
@@ -73,6 +73,134 @@ void MakeNormalVectors(const vec3_t forward, vec3_t right, vec3_t up)
     VectorMA(right, -d, forward, right);
     VectorNormalize(right);
     CrossProduct(right, forward, up);
+}
+
+void Matrix_TransformVec4(const vec4_t a, const mat4_t m, vec4_t out)
+{
+    const float x = a[0];
+    const float y = a[1];
+    const float z = a[2];
+    const float w = a[3];
+    out[0] = m[0] * x + m[4] * y + m[8] * z + m[12] * w;
+    out[1] = m[1] * x + m[5] * y + m[9] * z + m[13] * w;
+    out[2] = m[2] * x + m[6] * y + m[10] * z + m[14] * w;
+    out[3] = m[3] * x + m[7] * y + m[11] * z + m[15] * w;
+}
+
+void Matrix_Multiply(const mat4_t a, const mat4_t b, mat4_t out)
+{
+    const float a00 = a[0];
+    const float a01 = a[1];
+    const float a02 = a[2];
+    const float a03 = a[3];
+    const float a10 = a[4];
+    const float a11 = a[5];
+    const float a12 = a[6];
+    const float a13 = a[7];
+    const float a20 = a[8];
+    const float a21 = a[9];
+    const float a22 = a[10];
+    const float a23 = a[11];
+    const float a30 = a[12];
+    const float a31 = a[13];
+    const float a32 = a[14];
+    const float a33 = a[15];
+
+    // Cache only the current line of the second matrix
+    float b0 = b[0];
+    float b1 = b[1];
+    float b2 = b[2];
+    float b3 = b[3];
+    out[0] = b0 * a00 + b1 * a10 + b2 * a20 + b3 * a30;
+    out[1] = b0 * a01 + b1 * a11 + b2 * a21 + b3 * a31;
+    out[2] = b0 * a02 + b1 * a12 + b2 * a22 + b3 * a32;
+    out[3] = b0 * a03 + b1 * a13 + b2 * a23 + b3 * a33;
+
+    b0 = b[4];
+    b1 = b[5];
+    b2 = b[6];
+    b3 = b[7];
+    out[4] = b0 * a00 + b1 * a10 + b2 * a20 + b3 * a30;
+    out[5] = b0 * a01 + b1 * a11 + b2 * a21 + b3 * a31;
+    out[6] = b0 * a02 + b1 * a12 + b2 * a22 + b3 * a32;
+    out[7] = b0 * a03 + b1 * a13 + b2 * a23 + b3 * a33;
+
+    b0 = b[8];
+    b1 = b[9];
+    b2 = b[10];
+    b3 = b[11];
+    out[8] = b0 * a00 + b1 * a10 + b2 * a20 + b3 * a30;
+    out[9] = b0 * a01 + b1 * a11 + b2 * a21 + b3 * a31;
+    out[10] = b0 * a02 + b1 * a12 + b2 * a22 + b3 * a32;
+    out[11] = b0 * a03 + b1 * a13 + b2 * a23 + b3 * a33;
+
+    b0 = b[12];
+    b1 = b[13];
+    b2 = b[14];
+    b3 = b[15];
+    out[12] = b0 * a00 + b1 * a10 + b2 * a20 + b3 * a30;
+    out[13] = b0 * a01 + b1 * a11 + b2 * a21 + b3 * a31;
+    out[14] = b0 * a02 + b1 * a12 + b2 * a22 + b3 * a32;
+    out[15] = b0 * a03 + b1 * a13 + b2 * a23 + b3 * a33;
+}
+
+void Matrix_Frustum(float fov_x, float fov_y, float reflect_x, float znear, float zfar, float *matrix)
+{
+    float xmin, xmax, ymin, ymax;
+    float width, height, depth;
+
+    xmax = znear * tan(fov_x * (M_PI / 360));
+    xmin = -xmax;
+
+    ymax = znear * tan(fov_y * (M_PI / 360));
+    ymin = -ymax;
+
+    width = xmax - xmin;
+    height = ymax - ymin;
+    depth = zfar - znear;
+
+    matrix[0] = reflect_x * 2 * znear / width;
+    matrix[4] = 0;
+    matrix[8] = (xmax + xmin) / width;
+    matrix[12] = 0;
+
+    matrix[1] = 0;
+    matrix[5] = 2 * znear / height;
+    matrix[9] = (ymax + ymin) / height;
+    matrix[13] = 0;
+
+    matrix[2] = 0;
+    matrix[6] = 0;
+    matrix[10] = -(zfar + znear) / depth;
+    matrix[14] = -2 * zfar * znear / depth;
+
+    matrix[3] = 0;
+    matrix[7] = 0;
+    matrix[11] = -1;
+    matrix[15] = 0;
+}
+
+void Matrix_FromOriginAxis(const vec3_t origin, const vec3_t axis[3], mat4_t out)
+{
+    out[0] = -axis[1][0];
+    out[4] = -axis[1][1];
+    out[8] = -axis[1][2];
+    out[12] = DotProduct(axis[1], origin);
+
+    out[1] = axis[2][0];
+    out[5] = axis[2][1];
+    out[9] = axis[2][2];
+    out[13] = -DotProduct(axis[2], origin);
+
+    out[2] = -axis[0][0];
+    out[6] = -axis[0][1];
+    out[10] = -axis[0][2];
+    out[14] = DotProduct(axis[0], origin);
+
+    out[3] = 0;
+    out[7] = 0;
+    out[11] = 0;
+    out[15] = 1;
 }
 
 #endif  // USE_CLIENT
@@ -319,7 +447,7 @@ BoxOnPlaneSide
 Returns 1, 2, or 1 + 2
 ==================
 */
-int BoxOnPlaneSide(const vec3_t emins, const vec3_t emaxs, const cplane_t *p)
+box_plane_t BoxOnPlaneSide(const vec3_t emins, const vec3_t emaxs, const cplane_t *p)
 {
     const vec_t *bounds[2] = { emins, emaxs };
     int     i = p->signbits & 1;
@@ -331,9 +459,9 @@ int BoxOnPlaneSide(const vec3_t emins, const vec3_t emaxs, const cplane_t *p)
     p->normal[1] * bounds[j][1] + \
     p->normal[2] * bounds[k][2]
 
-    vec_t   dist1 = P(i ^ 1, j ^ 1, k ^ 1);
-    vec_t   dist2 = P(i, j, k);
-    int     sides = 0;
+    vec_t       dist1 = P(i ^ 1, j ^ 1, k ^ 1);
+    vec_t       dist2 = P(i, j, k);
+    box_plane_t sides = 0;
 
 #undef P
 
@@ -360,8 +488,8 @@ void SetupRotationMatrix(vec3_t matrix[3], const vec3_t dir, float degrees)
     vec_t   angle, s, c, one_c, xx, yy, zz, xy, yz, zx, xs, ys, zs;
 
     angle = DEG2RAD(degrees);
-    s = sin(angle);
-    c = cos(angle);
+    s = sinf(angle);
+    c = cosf(angle);
     one_c = 1.0F - c;
 
     xx = dir[0] * dir[0];
@@ -387,6 +515,17 @@ void SetupRotationMatrix(vec3_t matrix[3], const vec3_t dir, float degrees)
     matrix[2][2] = (one_c * zz) + c;
 }
 
+void RotatePointAroundVector(vec3_t out, const vec3_t dir, const vec3_t in, float degrees)
+{
+    vec3_t matrix[3];
+    vec3_t temp;
+
+    SetupRotationMatrix(matrix, dir, degrees);
+
+    VectorCopy(in, temp);
+    VectorRotate(temp, matrix, out);
+}
+
 #if USE_MD5
 
 #define X 0
@@ -405,7 +544,7 @@ void Quat_ComputeW(quat_t q)
     }
 }
 
-#define QUAT_EPSILON 0.000001f
+#define DOT_THRESHOLD   0.9995f
 
 void Quat_SLerp(const quat_t qa, const quat_t qb, float backlerp, float frontlerp, quat_t out)
 {
@@ -440,7 +579,7 @@ void Quat_SLerp(const quat_t qa, const quat_t qb, float backlerp, float frontler
     // compute interpolation fraction
     float k0, k1;
 
-    if (1.0f - cosOmega <= QUAT_EPSILON) {
+    if (cosOmega > DOT_THRESHOLD) {
         // very close - just use linear interpolation
         k0 = backlerp;
         k1 = frontlerp;
@@ -475,6 +614,65 @@ float Quat_Normalize(quat_t q)
     }
 
     return length;
+}
+
+void Quat_MultiplyQuat(const float *restrict qa, const float *restrict qb, quat_t out)
+{
+    out[W] = (qa[W] * qb[W]) - (qa[X] * qb[X]) - (qa[Y] * qb[Y]) - (qa[Z] * qb[Z]);
+    out[X] = (qa[X] * qb[W]) + (qa[W] * qb[X]) + (qa[Y] * qb[Z]) - (qa[Z] * qb[Y]);
+    out[Y] = (qa[Y] * qb[W]) + (qa[W] * qb[Y]) + (qa[Z] * qb[X]) - (qa[X] * qb[Z]);
+    out[Z] = (qa[Z] * qb[W]) + (qa[W] * qb[Z]) + (qa[X] * qb[Y]) - (qa[Y] * qb[X]);
+}
+
+void Quat_MultiplyVector(const float *restrict q, const float *restrict v, quat_t out)
+{
+    out[W] = -(q[X] * v[X]) - (q[Y] * v[Y]) - (q[Z] * v[Z]);
+    out[X] = (q[W] * v[X]) + (q[Y] * v[Z]) - (q[Z] * v[Y]);
+    out[Y] = (q[W] * v[Y]) + (q[Z] * v[X]) - (q[X] * v[Z]);
+    out[Z] = (q[W] * v[Z]) + (q[X] * v[Y]) - (q[Y] * v[X]);
+}
+
+// Conjugate quaternion. Also, inverse, for unit quaternions (which MD5 quats are)
+void Quat_Conjugate(const quat_t in, quat_t out)
+{
+    out[W] = in[W];
+    out[X] = -in[X];
+    out[Y] = -in[Y];
+    out[Z] = -in[Z];
+}
+
+void Quat_RotatePoint(const quat_t q, const vec3_t in, vec3_t out)
+{
+    quat_t tmp, inv, output;
+
+    // Assume q is unit quaternion
+    Quat_Conjugate(q, inv);
+    Quat_MultiplyVector(q, in, tmp);
+    Quat_MultiplyQuat(tmp, inv, output);
+
+    out[X] = output[X];
+    out[Y] = output[Y];
+    out[Z] = output[Z];
+}
+
+void Quat_ToAxis(const quat_t q, vec3_t axis[3])
+{
+    float q0 = q[W];
+    float q1 = q[X];
+    float q2 = q[Y];
+    float q3 = q[Z];
+
+    axis[0][0] = 2 * (q0 * q0 + q1 * q1) - 1;
+    axis[0][1] = 2 * (q1 * q2 - q0 * q3);
+    axis[0][2] = 2 * (q1 * q3 + q0 * q2);
+
+    axis[1][0] = 2 * (q1 * q2 + q0 * q3);
+    axis[1][1] = 2 * (q0 * q0 + q2 * q2) - 1;
+    axis[1][2] = 2 * (q2 * q3 - q0 * q1);
+
+    axis[2][0] = 2 * (q1 * q3 - q0 * q2);
+    axis[2][1] = 2 * (q2 * q3 + q0 * q1);
+    axis[2][2] = 2 * (q0 * q0 + q3 * q3) - 1;
 }
 
 #endif  // USE_MD5

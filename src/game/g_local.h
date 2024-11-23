@@ -17,15 +17,33 @@ with this program; if not, write to the Free Software Foundation, Inc.,
 */
 // g_local.h -- local definitions for game module
 
+// Disable all definitions conflicting between vanilla and rerelease ABI
+#define GAME3_INCLUDE
 #include "shared/shared.h"
+#include "shared/game3_shared.h"
 #include "shared/list.h"
 #include "shared/m_flash.h"
+
+typedef struct game3_edict_s edict_t;
+typedef struct gclient_s gclient_t;
+typedef game3_trace_t trace_t;
 
 // define GAME_INCLUDE so that game.h does not define the
 // short, server-visible gclient_t and edict_t structures,
 // because we define the full size ones in this file
 #define GAME_INCLUDE
 #include "shared/game.h"
+#include "shared/game3.h"
+
+// Compatibility definitions
+typedef csurface_v3_t csurface_t;
+typedef game3_entity_state_t entity_state_t;
+typedef game3_player_state_t player_state_t;
+typedef game3_pmove_state_t pmove_state_t;
+typedef game3_pmove_t pmove_t;
+typedef game3_usercmd_t usercmd_t;
+#define MAX_EDICTS  MAX_EDICTS_OLD
+#define MAX_STATS   MAX_STATS_GAME3
 
 // features this game supports
 #define G_FEATURES  (GMF_PROPERINUSE|GMF_WANT_ALL_DISCONNECTS|GMF_ENHANCED_SAVEGAMES)
@@ -168,7 +186,7 @@ typedef enum {
 #define SFL_CROSS_TRIGGER_6     BIT(5)
 #define SFL_CROSS_TRIGGER_7     BIT(6)
 #define SFL_CROSS_TRIGGER_8     BIT(7)
-#define SFL_CROSS_TRIGGER_MASK  (BIT(8) - 1)
+#define SFL_CROSS_TRIGGER_MASK  MASK(8)
 
 // noise types for PlayerNoise
 #define PNOISE_SELF             0
@@ -221,10 +239,10 @@ typedef struct {
 
 typedef struct gitem_s {
     char        *classname; // spawning name
-    bool        (*pickup)(struct edict_s *ent, struct edict_s *other);
-    void        (*use)(struct edict_s *ent, const struct gitem_s *item);
-    void        (*drop)(struct edict_s *ent, const struct gitem_s *item);
-    void        (*weaponthink)(struct edict_s *ent);
+    bool        (*pickup)(struct game3_edict_s *ent, struct game3_edict_s *other);
+    void        (*use)(struct game3_edict_s *ent, const struct gitem_s *item);
+    void        (*drop)(struct game3_edict_s *ent, const struct gitem_s *item);
+    void        (*weaponthink)(struct game3_edict_s *ent);
     char        *pickup_sound;
     char        *world_model;
     int         world_model_flags;
@@ -251,6 +269,14 @@ typedef struct precache_s {
     struct precache_s   *next;
     void                (*func)(void);
 } precache_t;
+
+// new game API can be used w/o protocol extensions,
+// so this needs to be dynamic
+#if USE_NEW_GAME_API
+#define PM_TIME_SHIFT   (game.csr.extended ? 0 : 3)
+#else
+#define PM_TIME_SHIFT   3
+#endif
 
 //
 // this structure is left intact through an entire game
@@ -433,8 +459,8 @@ typedef struct {
 
 extern  game_locals_t   game;
 extern  level_locals_t  level;
-extern  game_import_t   gi;
-extern  game_export_t   globals;
+extern  game3_import_t  gi;
+extern  game3_export_t  globals;
 extern  spawn_temp_t    st;
 
 extern  int sm_meat_index;
@@ -612,7 +638,6 @@ edict_t *G_Spawn(void);
 void    G_FreeEdict(edict_t *e);
 
 void    G_TouchTriggers(edict_t *ent);
-void    G_TouchSolids(edict_t *ent);
 
 char    *G_CopyString(char *in);
 
@@ -940,7 +965,7 @@ struct gclient_s {
     bool        update_chase;       // need to update chase info?
 };
 
-struct edict_s {
+struct game3_edict_s {
     entity_state_t  s;
     struct gclient_s    *client;    // NULL if not a player
                                     // the server expects the first part
@@ -968,8 +993,6 @@ struct edict_s {
     edict_t     *owner;
 
     //================================
-
-    entity_state_extension_t    x;
 
     // DO NOT MODIFY ANYTHING ABOVE THIS, THE SERVER
     // EXPECTS THE FIELDS IN THAT ORDER!

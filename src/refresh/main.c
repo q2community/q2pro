@@ -32,30 +32,37 @@ entity_t gl_world;
 
 refcfg_t r_config;
 
-int registration_sequence;
+unsigned r_registration_sequence;
 
 // regular variables
 cvar_t *gl_partscale;
 cvar_t *gl_partstyle;
+cvar_t *gl_beamstyle;
 cvar_t *gl_celshading;
 cvar_t *gl_dotshading;
 cvar_t *gl_shadows;
+cvar_t *gl_shadows_fade;
 cvar_t *gl_modulate;
 cvar_t *gl_modulate_world;
 cvar_t *gl_coloredlightmaps;
+cvar_t *gl_lightmap_bits;
 cvar_t *gl_brightness;
 cvar_t *gl_dynamic;
 cvar_t *gl_dlight_falloff;
 cvar_t *gl_modulate_entities;
-cvar_t *gl_doublelight_entities;
 cvar_t *gl_glowmap_intensity;
+cvar_t *gl_flarespeed;
 cvar_t *gl_fontshadow;
 cvar_t *gl_shaders;
 #if USE_MD5
 cvar_t *gl_md5_load;
 cvar_t *gl_md5_use;
+cvar_t *gl_md5_distance;
 #endif
+cvar_t *gl_damageblend_frac;
 cvar_t *gl_waterwarp;
+cvar_t *gl_fog;
+cvar_t *gl_bloom;
 cvar_t *gl_swapinterval;
 
 // development variables
@@ -66,14 +73,16 @@ cvar_t *gl_drawsky;
 cvar_t *gl_showtris;
 cvar_t *gl_showorigins;
 cvar_t *gl_showtearing;
+cvar_t *gl_showbloom;
 #if USE_DEBUG
-cvar_t *gl_showstats;
 cvar_t *gl_showscrap;
 cvar_t *gl_nobind;
+cvar_t *gl_novbo;
 cvar_t *gl_test;
 #endif
 cvar_t *gl_cull_nodes;
 cvar_t *gl_cull_models;
+cvar_t *gl_showcull;
 cvar_t *gl_clear;
 cvar_t *gl_finish;
 cvar_t *gl_novis;
@@ -84,10 +93,11 @@ cvar_t *gl_vertexlight;
 cvar_t *gl_lightgrid;
 cvar_t *gl_polyblend;
 cvar_t *gl_showerrors;
+cvar_t *gl_damageblend_frac;
+
+int32_t gl_shaders_modified;
 
 // ==============================================================================
-
-static const vec_t quad_tc[8] = { 0, 1, 0, 0, 1, 1, 1, 0 };
 
 static void GL_SetupFrustum(void)
 {
@@ -98,8 +108,8 @@ static void GL_SetupFrustum(void)
 
     // right/left
     angle = DEG2RAD(glr.fd.fov_x / 2);
-    sf = sin(angle);
-    cf = cos(angle);
+    sf = sinf(angle);
+    cf = cosf(angle);
 
     VectorScale(glr.viewaxis[0], sf, forward);
     VectorScale(glr.viewaxis[1], cf, left);
@@ -109,8 +119,8 @@ static void GL_SetupFrustum(void)
 
     // top/bottom
     angle = DEG2RAD(glr.fd.fov_y / 2);
-    sf = sin(angle);
-    cf = cos(angle);
+    sf = sinf(angle);
+    cf = cosf(angle);
 
     VectorScale(glr.viewaxis[0], sf, forward);
     VectorScale(glr.viewaxis[2], cf, up);
@@ -127,22 +137,19 @@ static void GL_SetupFrustum(void)
 
 glCullResult_t GL_CullBox(const vec3_t bounds[2])
 {
-    int i, bits;
+    box_plane_t bits;
     glCullResult_t cull;
 
-    if (!gl_cull_models->integer) {
+    if (!gl_cull_models->integer)
         return CULL_IN;
-    }
 
     cull = CULL_IN;
-    for (i = 0; i < 4; i++) {
+    for (int i = 0; i < 4; i++) {
         bits = BoxOnPlaneSide(bounds[0], bounds[1], &glr.frustumPlanes[i]);
-        if (bits == BOX_BEHIND) {
+        if (bits == BOX_BEHIND)
             return CULL_OUT;
-        }
-        if (bits != BOX_INFRONT) {
+        if (bits != BOX_INFRONT)
             cull = CULL_CLIP;
-        }
     }
 
     return cull;
@@ -151,24 +158,22 @@ glCullResult_t GL_CullBox(const vec3_t bounds[2])
 glCullResult_t GL_CullSphere(const vec3_t origin, float radius)
 {
     float dist;
-    cplane_t *p;
-    int i;
+    const cplane_t *p;
     glCullResult_t cull;
+    int i;
 
-    if (!gl_cull_models->integer) {
+    if (!gl_cull_models->integer)
         return CULL_IN;
-    }
 
     radius *= glr.entscale;
+
     cull = CULL_IN;
     for (i = 0, p = glr.frustumPlanes; i < 4; i++, p++) {
         dist = PlaneDiff(origin, p);
-        if (dist < -radius) {
+        if (dist < -radius)
             return CULL_OUT;
-        }
-        if (dist <= radius) {
+        if (dist <= radius)
             cull = CULL_CLIP;
-        }
     }
 
     return cull;
@@ -177,15 +182,14 @@ glCullResult_t GL_CullSphere(const vec3_t origin, float radius)
 glCullResult_t GL_CullLocalBox(const vec3_t origin, const vec3_t bounds[2])
 {
     vec3_t points[8];
-    cplane_t *p;
+    const cplane_t *p;
     int i, j;
     vec_t dot;
     bool infront;
     glCullResult_t cull;
 
-    if (!gl_cull_models->integer) {
+    if (!gl_cull_models->integer)
         return CULL_IN;
-    }
 
     for (i = 0; i < 8; i++) {
         VectorCopy(origin, points[i]);
@@ -201,26 +205,23 @@ glCullResult_t GL_CullLocalBox(const vec3_t origin, const vec3_t bounds[2])
             dot = DotProduct(points[j], p->normal);
             if (dot >= p->dist) {
                 infront = true;
-                if (cull == CULL_CLIP) {
+                if (cull == CULL_CLIP)
                     break;
-                }
             } else {
                 cull = CULL_CLIP;
-                if (infront) {
+                if (infront)
                     break;
-                }
             }
         }
-        if (!infront) {
+        if (!infront)
             return CULL_OUT;
-        }
     }
 
     return cull;
 }
 
 // shared between lightmap and scrap allocators
-bool GL_AllocBlock(int width, int height, int *inuse,
+bool GL_AllocBlock(int width, int height, uint16_t *inuse,
                    int w, int h, int *s, int *t)
 {
     int i, j, k, x, y, max_inuse, min_inuse;
@@ -231,12 +232,10 @@ bool GL_AllocBlock(int width, int height, int *inuse,
         max_inuse = 0;
         for (j = 0; j < w; j++) {
             k = inuse[i + j];
-            if (k >= min_inuse) {
+            if (k >= min_inuse)
                 break;
-            }
-            if (max_inuse < k) {
+            if (max_inuse < k)
                 max_inuse = k;
-            }
         }
         if (j == w) {
             x = i;
@@ -244,13 +243,11 @@ bool GL_AllocBlock(int width, int height, int *inuse,
         }
     }
 
-    if (y + h > height) {
+    if (y + h > height)
         return false;
-    }
 
-    for (i = 0; i < w; i++) {
+    for (i = 0; i < w; i++)
         inuse[x + i] = y + h;
-    }
 
     *s = x;
     *t = y;
@@ -275,7 +272,7 @@ void GL_MultMatrix(GLfloat *restrict p, const GLfloat *restrict a, const GLfloat
 
 void GL_SetEntityAxis(void)
 {
-    entity_t *e = glr.ent;
+    const entity_t *e = glr.ent;
 
     glr.entrotated = false;
     glr.entscale = 1;
@@ -289,249 +286,263 @@ void GL_SetEntityAxis(void)
         glr.entrotated = true;
     }
 
-    if (e->scale && e->scale != 1) {
-        VectorScale(glr.entaxis[0], e->scale, glr.entaxis[0]);
-        VectorScale(glr.entaxis[1], e->scale, glr.entaxis[1]);
-        VectorScale(glr.entaxis[2], e->scale, glr.entaxis[2]);
+    if ((e->scale[0] && e->scale[0] != 1) ||
+        (e->scale[1] && e->scale[1] != 1) ||
+        (e->scale[2] && e->scale[2] != 1)) {
+        VectorScale(glr.entaxis[0], e->scale[0], glr.entaxis[0]);
+        VectorScale(glr.entaxis[1], e->scale[1], glr.entaxis[1]);
+        VectorScale(glr.entaxis[2], e->scale[2], glr.entaxis[2]);
         glr.entrotated = true;
-        glr.entscale = e->scale;
+        glr.entscale = max(e->scale[0], max(e->scale[1], e->scale[2]));
     }
 }
 
 void GL_RotationMatrix(GLfloat *matrix)
 {
-    matrix[0] = glr.entaxis[0][0];
-    matrix[4] = glr.entaxis[1][0];
-    matrix[8] = glr.entaxis[2][0];
+    matrix[ 0] = glr.entaxis[0][0];
+    matrix[ 4] = glr.entaxis[1][0];
+    matrix[ 8] = glr.entaxis[2][0];
     matrix[12] = glr.ent->origin[0];
 
-    matrix[1] = glr.entaxis[0][1];
-    matrix[5] = glr.entaxis[1][1];
-    matrix[9] = glr.entaxis[2][1];
+    matrix[ 1] = glr.entaxis[0][1];
+    matrix[ 5] = glr.entaxis[1][1];
+    matrix[ 9] = glr.entaxis[2][1];
     matrix[13] = glr.ent->origin[1];
 
-    matrix[2] = glr.entaxis[0][2];
-    matrix[6] = glr.entaxis[1][2];
+    matrix[ 2] = glr.entaxis[0][2];
+    matrix[ 6] = glr.entaxis[1][2];
     matrix[10] = glr.entaxis[2][2];
     matrix[14] = glr.ent->origin[2];
 
-    matrix[3] = 0;
-    matrix[7] = 0;
+    matrix[ 3] = 0;
+    matrix[ 7] = 0;
     matrix[11] = 0;
     matrix[15] = 1;
 }
 
-void GL_RotateForEntity(void)
+void GL_RotateForEntity(bool skies)
 {
-    GLfloat matrix[16];
-
-    GL_RotationMatrix(matrix);
-    GL_MultMatrix(glr.entmatrix, glr.viewmatrix, matrix);
-    GL_ForceMatrix(glr.entmatrix);
+    GL_RotationMatrix(glr.entmatrix);
+    if (skies) {
+        GL_MultMatrix(gls.u_block.m_sky[0], glr.skymatrix[0], glr.entmatrix);
+        GL_MultMatrix(gls.u_block.m_sky[1], glr.skymatrix[1], glr.entmatrix);
+    }
+    GL_ForceMatrix(glr.entmatrix, glr.viewmatrix);
 }
 
 static void GL_DrawSpriteModel(const model_t *model)
 {
     const entity_t *e = glr.ent;
-    const mspriteframe_t *frame = &model->spriteframes[(unsigned)e->frame % model->numframes];
+    const mspriteframe_t *frame = &model->spriteframes[e->frame % model->numframes];
     const image_t *image = frame->image;
-    const float alpha = (e->flags & RF_TRANSLUCENT) ? e->alpha : 1;
-    int bits = GLS_DEPTHMASK_FALSE;
+    const float alpha = (e->flags & RF_TRANSLUCENT) ? e->alpha : 1.0f;
+    glStateBits_t bits = GLS_DEPTHMASK_FALSE | glr.fog_bits;
     vec3_t up, down, left, right;
-    vec3_t points[4];
 
-    if (alpha == 1) {
+    if (alpha == 1.0f) {
         if (image->flags & IF_TRANSPARENT) {
-            if (image->flags & IF_PALETTED) {
+            if (image->flags & IF_PALETTED)
                 bits |= GLS_ALPHATEST_ENABLE;
-            } else {
+            else
                 bits |= GLS_BLEND_BLEND;
-            }
         }
     } else {
         bits |= GLS_BLEND_BLEND;
     }
 
-    GL_LoadMatrix(glr.viewmatrix);
-    GL_BindTexture(0, image->texnum);
+    GL_LoadMatrix(gl_identity, glr.viewmatrix);
+    GL_LoadUniforms();
+    GL_BindTexture(TMU_TEXTURE, image->texnum);
+    GL_BindArrays(VA_SPRITE);
     GL_StateBits(bits);
     GL_ArrayBits(GLA_VERTEX | GLA_TC);
     GL_Color(1, 1, 1, alpha);
 
-    VectorScale(glr.viewaxis[1], frame->origin_x, left);
-    VectorScale(glr.viewaxis[1], frame->origin_x - frame->width, right);
-    VectorScale(glr.viewaxis[2], -frame->origin_y, down);
-    VectorScale(glr.viewaxis[2], frame->height - frame->origin_y, up);
+    float scale = e->scale[0] ? e->scale[0] : 1.0f;
 
-    VectorAdd3(e->origin, down, left, points[0]);
-    VectorAdd3(e->origin, up, left, points[1]);
-    VectorAdd3(e->origin, down, right, points[2]);
-    VectorAdd3(e->origin, up, right, points[3]);
+    VectorScale(glr.viewaxis[1], frame->origin_x * scale, left);
+    VectorScale(glr.viewaxis[1], (frame->origin_x - frame->width) * scale, right);
+    VectorScale(glr.viewaxis[2], (-frame->origin_y) * scale, down);
+    VectorScale(glr.viewaxis[2], (frame->height - frame->origin_y) * scale, up);
 
-    GL_TexCoordPointer(2, 0, quad_tc);
-    GL_VertexPointer(3, 0, &points[0][0]);
+    VectorAdd3(e->origin, down, left,  tess.vertices);
+    VectorAdd3(e->origin, up,   left,  tess.vertices +  5);
+    VectorAdd3(e->origin, down, right, tess.vertices + 10);
+    VectorAdd3(e->origin, up,   right, tess.vertices + 15);
+
+    tess.vertices[ 3] = 0; tess.vertices[ 4] = 1;
+    tess.vertices[ 8] = 0; tess.vertices[ 9] = 0;
+    tess.vertices[13] = 1; tess.vertices[14] = 1;
+    tess.vertices[18] = 1; tess.vertices[19] = 0;
+
+    GL_LockArrays(4);
     qglDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    GL_UnlockArrays();
 }
 
 static void GL_DrawNullModel(void)
 {
-    static const uint32_t colors[6] = {
-        U32_RED, U32_RED,
-        U32_GREEN, U32_GREEN,
-        U32_BLUE, U32_BLUE
-    };
     const entity_t *e = glr.ent;
-    vec3_t points[6];
 
-    VectorCopy(e->origin, points[0]);
-    VectorCopy(e->origin, points[2]);
-    VectorCopy(e->origin, points[4]);
+    VectorCopy(e->origin, tess.vertices +  0);
+    VectorCopy(e->origin, tess.vertices +  8);
+    VectorCopy(e->origin, tess.vertices + 16);
 
-    VectorMA(e->origin, 16, glr.entaxis[0], points[1]);
-    VectorMA(e->origin, 16, glr.entaxis[1], points[3]);
-    VectorMA(e->origin, 16, glr.entaxis[2], points[5]);
+    VectorMA(e->origin, 16, glr.entaxis[0], tess.vertices +  4);
+    VectorMA(e->origin, 16, glr.entaxis[1], tess.vertices + 12);
+    VectorMA(e->origin, 16, glr.entaxis[2], tess.vertices + 20);
 
-    GL_LoadMatrix(glr.viewmatrix);
-    GL_BindTexture(0, TEXNUM_WHITE);
+    WN32(tess.vertices +  3, COLOR_RED.u32);
+    WN32(tess.vertices +  7, COLOR_RED.u32);
+
+    WN32(tess.vertices + 11, COLOR_GREEN.u32);
+    WN32(tess.vertices + 15, COLOR_GREEN.u32);
+
+    WN32(tess.vertices + 19, COLOR_BLUE.u32);
+    WN32(tess.vertices + 23, COLOR_BLUE.u32);
+
+    GL_LoadMatrix(glr.entmatrix, glr.viewmatrix);
+    GL_LoadUniforms();
+    GL_BindTexture(TMU_TEXTURE, TEXNUM_WHITE);
+    GL_BindArrays(VA_NULLMODEL);
     GL_StateBits(GLS_DEFAULT);
     GL_ArrayBits(GLA_VERTEX | GLA_COLOR);
-    GL_ColorBytePointer(4, 0, (GLubyte *)colors);
-    GL_VertexPointer(3, 0, &points[0][0]);
+
+    GL_LockArrays(6);
     qglDrawArrays(GL_LINES, 0, 6);
+    GL_UnlockArrays();
 }
 
-static void make_flare_quad(const entity_t *e, float scale, vec3_t points[4])
+static void make_flare_quad(const vec3_t origin, float scale)
 {
     vec3_t up, down, left, right;
 
-    scale *= e->scale;
-
-    VectorScale(glr.viewaxis[1], scale, left);
+    VectorScale(glr.viewaxis[1],  scale, left);
     VectorScale(glr.viewaxis[1], -scale, right);
     VectorScale(glr.viewaxis[2], -scale, down);
-    VectorScale(glr.viewaxis[2], scale, up);
+    VectorScale(glr.viewaxis[2],  scale, up);
 
-    VectorAdd3(e->origin, down, left, points[0]);
-    VectorAdd3(e->origin, up, left, points[1]);
-    VectorAdd3(e->origin, down, right, points[2]);
-    VectorAdd3(e->origin, up, right, points[3]);
+    VectorAdd3(origin, down, left,  tess.vertices + 0);
+    VectorAdd3(origin, up,   left,  tess.vertices + 3);
+    VectorAdd3(origin, down, right, tess.vertices + 6);
+    VectorAdd3(origin, up,   right, tess.vertices + 9);
 }
 
 static void GL_OccludeFlares(void)
 {
-    vec3_t points[4];
-    entity_t *e;
+    const bsp_t *bsp = gl_static.world.cache;
+    const entity_t *e;
     glquery_t *q;
-    int i;
+    int i, j;
+    vec3_t dir, org;
+    float scale, dist;
+    bool set = false;
 
     if (!glr.num_flares)
         return;
     if (!gl_static.queries)
         return;
 
-    GL_LoadMatrix(glr.viewmatrix);
-    GL_StateBits(GLS_DEPTHMASK_FALSE);
-    GL_ArrayBits(GLA_VERTEX);
-    qglColorMask(0, 0, 0, 0);
-    GL_BindTexture(0, TEXNUM_WHITE);
-    GL_VertexPointer(3, 0, &points[0][0]);
-
     for (i = 0, e = glr.fd.entities; i < glr.fd.num_entities; i++, e++) {
         if (!(e->flags & RF_FLARE))
             continue;
 
         q = HashMap_Lookup(glquery_t, gl_static.queries, &e->skinnum);
-        if (q && q->pending)
-            continue;
 
-        if (!q) {
-            glquery_t new = { 0 };
-            qglGenQueries(1, &new.query);
-            HashMap_Insert(gl_static.queries, &e->skinnum, &new);
-            q = HashMap_GetValue(glquery_t, gl_static.queries, HashMap_Size(gl_static.queries) - 1);
+        for (j = 0; j < 4; j++)
+            if (PlaneDiff(e->origin, &glr.frustumPlanes[j]) < -2.5f)
+                break;
+        if (j != 4) {
+            if (q)
+                q->pending = q->visible = false;
+            continue;   // not visible
         }
 
-        make_flare_quad(e, 2.5f, points);
+        if (q) {
+            // reset visibility if entity disappeared
+            if (com_eventTime - q->timestamp >= 2500) {
+                q->pending = q->visible = false;
+                q->frac = 0;
+            } else {
+                if (q->pending)
+                    continue;
+                if (com_eventTime - q->timestamp <= 33)
+                    continue;
+            }
+        } else {
+            glquery_t new = { 0 };
+            uint32_t map_size = HashMap_Size(gl_static.queries);
+            Q_assert(map_size < MAX_EDICTS);
+            qglGenQueries(1, &new.query);
+            HashMap_Insert(gl_static.queries, &e->skinnum, &new);
+            q = HashMap_GetValue(glquery_t, gl_static.queries, map_size);
+        }
 
+        if (!set) {
+            GL_LoadMatrix(gl_identity, glr.viewmatrix);
+            GL_LoadUniforms();
+            GL_BindTexture(TMU_TEXTURE, TEXNUM_WHITE);
+            GL_BindArrays(VA_OCCLUDE);
+            GL_StateBits(GLS_DEPTHMASK_FALSE);
+            GL_ArrayBits(GLA_VERTEX);
+            qglColorMask(0, 0, 0, 0);
+            set = true;
+        }
+
+        VectorSubtract(e->origin, glr.fd.vieworg, dir);
+        dist = DotProduct(dir, glr.viewaxis[0]);
+
+        scale = 2.5f;
+        if (dist > 20)
+            scale += dist * 0.004f;
+
+        if (bsp && BSP_PointLeaf(bsp->nodes, e->origin)->contents == CONTENTS_SOLID) {
+            VectorNormalize(dir);
+            VectorMA(e->origin, -5.0f, dir, org);
+            make_flare_quad(org, scale);
+        } else
+            make_flare_quad(e->origin, scale);
+
+        GL_LockArrays(4);
         qglBeginQuery(gl_static.samples_passed, q->query);
         qglDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
         qglEndQuery(gl_static.samples_passed);
+        GL_UnlockArrays();
 
+        q->timestamp = com_eventTime;
         q->pending = true;
+
+        c.occlusionQueries++;
     }
 
-    qglColorMask(1, 1, 1, 1);
-}
-
-static void GL_DrawFlare(const entity_t *e)
-{
-    vec3_t points[4];
-    GLuint result;
-    glquery_t *q;
-
-    if (!gl_static.queries)
-        return;
-
-    q = HashMap_Lookup(glquery_t, gl_static.queries, &e->skinnum);
-    if (!q) {
-        glr.num_flares++;
-        return;
-    }
-
-    if (q->pending) {
-        qglGetQueryObjectuiv(q->query, GL_QUERY_RESULT_AVAILABLE, &result);
-        if (result) {
-            qglGetQueryObjectuiv(q->query, GL_QUERY_RESULT, &result);
-            q->visible = result;
-            q->pending = false;
-        }
-    }
-
-    if (!q->pending)
-        glr.num_flares++;
-
-    if (!q->visible)
-        return;
-
-    GL_LoadMatrix(glr.viewmatrix);
-    GL_BindTexture(0, IMG_ForHandle(e->skin)->texnum);
-    GL_StateBits(GLS_DEPTHTEST_DISABLE | GLS_DEPTHMASK_FALSE | GLS_BLEND_ADD);
-    GL_ArrayBits(GLA_VERTEX | GLA_TC);
-    GL_Color(e->rgba.u8[0] / 255.0f,
-             e->rgba.u8[1] / 255.0f,
-             e->rgba.u8[2] / 255.0f,
-             e->alpha * 0.5f);
-
-    make_flare_quad(e, 25.0f, points);
-
-    GL_TexCoordPointer(2, 0, quad_tc);
-    GL_VertexPointer(3, 0, &points[0][0]);
-    qglDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    if (set)
+        qglColorMask(1, 1, 1, 1);
 }
 
 static void GL_DrawEntities(int musthave, int canthave)
 {
-    entity_t *ent, *last;
+    entity_t *ent;
     model_t *model;
+    int i;
 
-    if (!gl_drawentities->integer) {
+    if (!gl_drawentities->integer)
         return;
-    }
 
-    last = glr.fd.entities + glr.fd.num_entities;
-    for (ent = glr.fd.entities; ent != last; ent++) {
+    for (i = 0, ent = glr.fd.entities; i < glr.fd.num_entities; i++, ent++) {
         if (ent->flags & RF_BEAM) {
             // beams are drawn elsewhere in single batch
             glr.num_beams++;
             continue;
         }
-        if ((ent->flags & musthave) != musthave || (ent->flags & canthave)) {
-            continue;
-        }
+
         if (ent->flags & RF_FLARE) {
-            GL_DrawFlare(ent);
+            // flares are drawn elsewhere in single batch
+            glr.num_flares++;
             continue;
         }
+
+        if ((ent->flags & musthave) != musthave || (ent->flags & canthave))
+            continue;
 
         glr.ent = ent;
 
@@ -540,18 +551,16 @@ static void GL_DrawEntities(int musthave, int canthave)
 
         // inline BSP model
         if (ent->model & BIT(31)) {
-            bsp_t *bsp = gl_static.world.cache;
+            const bsp_t *bsp = gl_static.world.cache;
             int index = ~ent->model;
 
-            if (glr.fd.rdflags & RDF_NOWORLDMODEL) {
+            if (glr.fd.rdflags & RDF_NOWORLDMODEL)
                 Com_Error(ERR_DROP, "%s: inline model without world",
                           __func__);
-            }
 
-            if (index < 1 || index >= bsp->nummodels) {
+            if (index < 1 || index >= bsp->nummodels)
                 Com_Error(ERR_DROP, "%s: inline model %d out of range",
                           __func__, index);
-            }
 
             GL_DrawBspModel(&bsp->models[index]);
             continue;
@@ -576,9 +585,8 @@ static void GL_DrawEntities(int musthave, int canthave)
             Q_assert(!"bad model type");
         }
 
-        if (gl_showorigins->integer) {
+        if (gl_showorigins->integer)
             GL_DrawNullModel();
-        }
     }
 }
 
@@ -588,11 +596,10 @@ static void GL_DrawTearing(void)
 
     // alternate colors to make tearing obvious
     i++;
-    if (i & 1) {
+    if (i & 1)
         qglClearColor(1, 1, 1, 1);
-    } else {
+    else
         qglClearColor(1, 0, 0, 0);
-    }
 
     qglClear(GL_COLOR_BUFFER_BIT);
     qglClearColor(0, 0, 0, 1);
@@ -600,10 +607,8 @@ static void GL_DrawTearing(void)
 
 static const char *GL_ErrorString(GLenum err)
 {
-    const char *str;
-
     switch (err) {
-#define E(x) case GL_##x: str = "GL_"#x; break;
+#define E(x) case GL_##x: return "GL_"#x;
         E(NO_ERROR)
         E(INVALID_ENUM)
         E(INVALID_VALUE)
@@ -611,11 +616,10 @@ static const char *GL_ErrorString(GLenum err)
         E(STACK_OVERFLOW)
         E(STACK_UNDERFLOW)
         E(OUT_OF_MEMORY)
-    default: str = "UNKNOWN ERROR";
 #undef E
     }
 
-    return str;
+    return "UNKNOWN ERROR";
 }
 
 void GL_ClearErrors(void)
@@ -630,53 +634,109 @@ bool GL_ShowErrors(const char *func)
 {
     GLenum err = qglGetError();
 
-    if (err == GL_NO_ERROR) {
+    if (err == GL_NO_ERROR)
         return false;
-    }
 
     do {
-        if (gl_showerrors->integer) {
+        if (gl_showerrors->integer)
             Com_EPrintf("%s: %s\n", func, GL_ErrorString(err));
-        }
     } while ((err = qglGetError()) != GL_NO_ERROR);
 
     return true;
 }
 
-static void GL_WaterWarp(void)
+static void GL_PostProcess(glStateBits_t bits, int x, int y, int w, int h)
 {
-    GL_ForceTexture(0, gl_static.warp_texture);
+    GL_BindArrays(VA_POSTPROCESS);
     GL_StateBits(GLS_DEPTHTEST_DISABLE | GLS_DEPTHMASK_FALSE |
-                 GLS_CULL_DISABLE | GLS_TEXTURE_REPLACE | GLS_WARP_ENABLE);
+                 GLS_CULL_DISABLE | GLS_TEXTURE_REPLACE | bits);
     GL_ArrayBits(GLA_VERTEX | GLA_TC);
+    gl_backend->load_uniforms();
 
-    vec_t points[8] = {
-        glr.fd.x,                glr.fd.y,
-        glr.fd.x,                glr.fd.y + glr.fd.height,
-        glr.fd.x + glr.fd.width, glr.fd.y,
-        glr.fd.x + glr.fd.width, glr.fd.y + glr.fd.height,
-    };
+    Vector4Set(tess.vertices,      x,     y,     0, 1);
+    Vector4Set(tess.vertices +  4, x,     y + h, 0, 0);
+    Vector4Set(tess.vertices +  8, x + w, y,     1, 1);
+    Vector4Set(tess.vertices + 12, x + w, y + h, 1, 0);
 
-    GL_TexCoordPointer(2, 0, quad_tc);
-    GL_VertexPointer(2, 0, points);
+    GL_LockArrays(4);
     qglDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    GL_UnlockArrays();
 }
 
-void R_RenderFrame(refdef_t *fd)
+static void GL_DrawBloom(bool waterwarp)
+{
+    int iterations = Cvar_ClampInteger(gl_bloom, 1, 8) * 2;
+    int w = glr.fd.width / 4;
+    int h = glr.fd.height / 4;
+
+    qglViewport(0, 0, w, h);
+    GL_Ortho(0, w, h, 0, -1, 1);
+
+    // downscale
+    gls.u_block.fog_color[0] = 1.0f / w;
+    gls.u_block.fog_color[1] = 1.0f / h;
+    GL_ForceTexture(TMU_TEXTURE, TEXNUM_PP_BLOOM);
+    qglBindFramebuffer(GL_FRAMEBUFFER, FBO_BLUR_0);
+    GL_PostProcess(GLS_BLUR_BOX, 0, 0, w, h);
+
+    // blur X/Y
+    for (int i = 0; i < iterations; i++) {
+        int j = i & 1;
+
+        gls.u_block.fog_color[0] = 1.0f / w;
+        gls.u_block.fog_color[1] = 1.0f / h;
+        gls.u_block.fog_color[j] = 0;
+
+        GL_ForceTexture(TMU_TEXTURE, j ? TEXNUM_PP_BLUR_1 : TEXNUM_PP_BLUR_0);
+        qglBindFramebuffer(GL_FRAMEBUFFER, j ? FBO_BLUR_0 : FBO_BLUR_1);
+        GL_PostProcess(GLS_BLUR_GAUSS, 0, 0, w, h);
+    }
+
+    GL_Setup2D();
+
+    glStateBits_t bits = GLS_BLOOM_OUTPUT;
+    if (q_unlikely(gl_showbloom->integer)) {
+        GL_ForceTexture(TMU_TEXTURE, TEXNUM_PP_BLUR_0);
+        bits = GLS_DEFAULT;
+    } else {
+        GL_ForceTexture(TMU_TEXTURE, TEXNUM_PP_SCENE);
+        GL_ForceTexture(TMU_LIGHTMAP, TEXNUM_PP_BLUR_0);
+        if (waterwarp)
+            bits |= GLS_WARP_ENABLE;
+    }
+
+    // upscale & add
+    qglBindFramebuffer(GL_FRAMEBUFFER, 0);
+    GL_PostProcess(bits, glr.fd.x, glr.fd.y, glr.fd.width, glr.fd.height);
+}
+
+static int32_t gl_bloom_modified = 0;
+
+void R_RenderFrame(const refdef_t *fd)
 {
     GL_Flush2D();
 
     Q_assert(gl_static.world.cache || (fd->rdflags & RDF_NOWORLDMODEL));
 
+    glr.frametime = (com_eventTime - glr.timestamp) * 0.001f;
+    glr.timestamp = com_eventTime;
+
     glr.drawframe++;
-    glr.rand_seed = fd->time * 20;
 
     glr.fd = *fd;
-    glr.num_beams = 0;
-    glr.num_flares = 0;
+    glr.num_beams = glr.num_flares   = 0;
+    glr.fog_bits  = glr.fog_bits_sky = 0;
 
-    if (gl_dynamic->integer != 1 || gl_vertexlight->integer) {
+    if (gl_dynamic->integer != 1 || gl_vertexlight->integer)
         glr.fd.num_dlights = 0;
+
+    if (gl_static.use_shaders && gl_fog->integer > 0) {
+        if (glr.fd.fog.density > 0)
+            glr.fog_bits |= GLS_FOG_GLOBAL;
+        if (glr.fd.heightfog.density > 0 && glr.fd.heightfog.falloff > 0)
+            glr.fog_bits |= GLS_FOG_HEIGHT;
+        if (glr.fd.fog.sky_factor > 0)
+            glr.fog_bits_sky |= GLS_FOG_SKY;
     }
 
     if (lm.dirty) {
@@ -684,30 +744,43 @@ void R_RenderFrame(refdef_t *fd)
         lm.dirty = false;
     }
 
-    bool waterwarp = (glr.fd.rdflags & RDF_UNDERWATER) && gl_static.use_shaders && gl_waterwarp->integer;
+    bool waterwarp = false;
+    bool bloom = false;
 
-    if (waterwarp) {
-        if (glr.fd.width != glr.framebuffer_width || glr.fd.height != glr.framebuffer_height) {
-            glr.framebuffer_ok = GL_InitWarpTexture();
-            glr.framebuffer_width = glr.fd.width;
-            glr.framebuffer_height = glr.fd.height;
+    if (gl_static.use_shaders) {
+        waterwarp = (glr.fd.rdflags & RDF_UNDERWATER) && gl_waterwarp->integer;
+        bloom = !(glr.fd.rdflags & RDF_NOWORLDMODEL) && gl_bloom->integer;
+
+        if (waterwarp || bloom || gl_bloom->modified_count != gl_bloom_modified) {
+            if (glr.fd.width != glr.framebuffer_width || glr.fd.height != glr.framebuffer_height || gl_bloom->modified_count != gl_bloom_modified) {
+                glr.framebuffer_ok = GL_InitFramebuffers();
+                glr.framebuffer_width = glr.fd.width;
+                glr.framebuffer_height = glr.fd.height;
+                gl_bloom_modified = gl_bloom->modified_count;
+            }
+            if (!glr.framebuffer_ok)
+                waterwarp = bloom = false;
         }
-        waterwarp = glr.framebuffer_ok;
     }
 
-    if (waterwarp) {
-        qglBindFramebuffer(GL_FRAMEBUFFER, gl_static.warp_framebuffer);
+    if (waterwarp || bloom) {
+        qglBindFramebuffer(GL_FRAMEBUFFER, FBO_SCENE);
+        glr.framebuffer_bound = true;
+
+        if (gl_clear->integer) {
+            GLenum buffers[2] = { GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1 };
+            qglDrawBuffers(bloom + 1, buffers);
+            qglClear(GL_COLOR_BUFFER_BIT);
+            qglDrawBuffers(1, buffers);
+        }
     }
 
-    GL_Setup3D(waterwarp);
+    GL_Setup3D();
 
-    if (gl_cull_nodes->integer) {
-        GL_SetupFrustum();
-    }
+    GL_SetupFrustum();
 
-    if (!(glr.fd.rdflags & RDF_NOWORLDMODEL) && gl_drawworld->integer) {
+    if (!(glr.fd.rdflags & RDF_NOWORLDMODEL) && gl_drawworld->integer)
         GL_DrawWorld();
-    }
 
     GL_DrawEntities(0, RF_TRANSLUCENT);
 
@@ -719,73 +792,83 @@ void R_RenderFrame(refdef_t *fd)
 
     GL_OccludeFlares();
 
-    if (!(glr.fd.rdflags & RDF_NOWORLDMODEL)) {
+    GL_DrawFlares();
+
+    if (!(glr.fd.rdflags & RDF_NOWORLDMODEL))
         GL_DrawAlphaFaces();
-    }
 
     GL_DrawEntities(RF_TRANSLUCENT | RF_WEAPONMODEL, 0);
 
-    if (waterwarp) {
+    GL_DrawDebugObjects();
+
+    if (glr.framebuffer_bound) {
         qglBindFramebuffer(GL_FRAMEBUFFER, 0);
+        glr.framebuffer_bound = false;
     }
 
     // go back into 2D mode
     GL_Setup2D();
 
-    if (waterwarp) {
-        GL_WaterWarp();
+    if (bloom) {
+        GL_DrawBloom(waterwarp);
+    } else if (waterwarp) {
+        GL_ForceTexture(TMU_TEXTURE, TEXNUM_PP_SCENE);
+        GL_PostProcess(GLS_WARP_ENABLE, glr.fd.x, glr.fd.y, glr.fd.width, glr.fd.height);
     }
 
-    if (gl_polyblend->integer && glr.fd.blend[3] != 0) {
+    if (gl_polyblend->integer)
         GL_Blend();
-    }
 
 #if USE_DEBUG
-    if (gl_lightmap->integer > 1) {
+    if (gl_lightmap->integer > 1)
         Draw_Lightmaps();
-    }
 #endif
 
-    GL_ShowErrors(__func__);
+    if (gl_showerrors->integer > 1)
+        GL_ShowErrors(__func__);
+}
+
+bool R_SupportsPerPixelLighting(void)
+{
+    return gl_backend->use_per_pixel_lighting();
 }
 
 void R_BeginFrame(void)
 {
     memset(&c, 0, sizeof(c));
 
-    if (gl_finish->integer) {
+    if (gl_finish->integer)
         qglFinish();
-    }
 
     GL_Setup2D();
 
-    if (gl_clear->integer) {
+    if (gl_clear->integer)
         qglClear(GL_COLOR_BUFFER_BIT);
-    }
 
-    GL_ShowErrors(__func__);
+    if (gl_showerrors->integer > 1)
+        GL_ShowErrors(__func__);
 }
 
 void R_EndFrame(void)
 {
-#if USE_DEBUG
-    if (gl_showstats->integer) {
+    if (SCR_StatActive()) {
         GL_Flush2D();
-        Draw_Stats();
+        SCR_DrawStats();
     }
-    if (gl_showscrap->integer) {
+
+#if USE_DEBUG
+    if (gl_showscrap->integer)
         Draw_Scrap();
-    }
 #endif
     GL_Flush2D();
 
-    if (gl_showtearing->integer) {
+    if (gl_showtearing->integer)
         GL_DrawTearing();
-    }
 
-    GL_ShowErrors(__func__);
+    if (gl_showerrors->integer > 1)
+        GL_ShowErrors(__func__);
 
-    vid.swap_buffers();
+    vid->swap_buffers();
 }
 
 // ==============================================================================
@@ -793,7 +876,6 @@ void R_EndFrame(void)
 static void GL_Strings_f(void)
 {
     GLint integer = 0;
-    GLfloat value = 0;
 
     Com_Printf("GL_VENDOR: %s\n", qglGetString(GL_VENDOR));
     Com_Printf("GL_RENDERER: %s\n", qglGetString(GL_RENDERER));
@@ -830,8 +912,7 @@ static void GL_Strings_f(void)
     }
 
     if (gl_config.caps & QGL_CAP_TEXTURE_ANISOTROPY) {
-        qglGetFloatv(GL_MAX_TEXTURE_MAX_ANISOTROPY, &value);
-        Com_Printf("GL_MAX_TEXTURE_MAX_ANISOTROPY: %.f\n", value);
+        Com_Printf("GL_MAX_TEXTURE_MAX_ANISOTROPY: %.f\n", gl_config.max_anisotropy);
     }
 
     Com_Printf("GL_PFD: color(%d-bit) Z(%d-bit) stencil(%d-bit)\n",
@@ -840,7 +921,7 @@ static void GL_Strings_f(void)
 
 static size_t GL_ViewCluster_m(char *buffer, size_t size)
 {
-    return Q_scnprintf(buffer, size, "%d", glr.viewcluster1);
+    return Q_snprintf(buffer, size, "%d", glr.viewcluster1);
 }
 
 static void gl_lightmap_changed(cvar_t *self)
@@ -881,8 +962,8 @@ static void gl_novis_changed(cvar_t *self)
 
 static void gl_swapinterval_changed(cvar_t *self)
 {
-    if (vid.swap_interval)
-        vid.swap_interval(self->integer);
+    if (vid && vid->swap_interval)
+        vid->swap_interval(self->integer);
 }
 
 static void GL_Register(void)
@@ -890,15 +971,19 @@ static void GL_Register(void)
     // regular variables
     gl_partscale = Cvar_Get("gl_partscale", "2", 0);
     gl_partstyle = Cvar_Get("gl_partstyle", "0", 0);
+    gl_beamstyle = Cvar_Get("gl_beamstyle", "0", 0);
     gl_celshading = Cvar_Get("gl_celshading", "0", 0);
-    gl_dotshading = Cvar_Get("gl_dotshading", "1", 0);
-    gl_shadows = Cvar_Get("gl_shadows", "0", CVAR_ARCHIVE);
-    gl_modulate = Cvar_Get("gl_modulate", "1", CVAR_ARCHIVE);
+    gl_dotshading = Cvar_Get("gl_dotshading", "0", 0);
+    gl_shadows = Cvar_Get("gl_shadows", "1", CVAR_ARCHIVE);
+    gl_shadows_fade = Cvar_Get("gl_shadows_fade", "1", 0);
+    gl_modulate = Cvar_Get("gl_modulate", "2", CVAR_ARCHIVE);
     gl_modulate->changed = gl_modulate_changed;
     gl_modulate_world = Cvar_Get("gl_modulate_world", "1", 0);
     gl_modulate_world->changed = gl_lightmap_changed;
     gl_coloredlightmaps = Cvar_Get("gl_coloredlightmaps", "1", 0);
     gl_coloredlightmaps->changed = gl_lightmap_changed;
+    gl_lightmap_bits = Cvar_Get("gl_lightmap_bits", "0", 0);
+    gl_lightmap_bits->changed = gl_lightmap_changed;
     gl_brightness = Cvar_Get("gl_brightness", "0", 0);
     gl_brightness->changed = gl_lightmap_changed;
     gl_dynamic = Cvar_Get("gl_dynamic", "1", 0);
@@ -906,15 +991,19 @@ static void GL_Register(void)
     gl_dlight_falloff = Cvar_Get("gl_dlight_falloff", "1", 0);
     gl_modulate_entities = Cvar_Get("gl_modulate_entities", "1", 0);
     gl_modulate_entities->changed = gl_modulate_entities_changed;
-    gl_doublelight_entities = Cvar_Get("gl_doublelight_entities", "1", 0);
-    gl_glowmap_intensity = Cvar_Get("gl_glowmap_intensity", "0.75", 0);
+    gl_glowmap_intensity = Cvar_Get("gl_glowmap_intensity", "1", 0);
+    gl_flarespeed = Cvar_Get("gl_flarespeed", "8", 0);
     gl_fontshadow = Cvar_Get("gl_fontshadow", "0", 0);
-    gl_shaders = Cvar_Get("gl_shaders", (gl_config.caps & QGL_CAP_SHADER) ? "1" : "0", CVAR_REFRESH);
+    gl_shaders = Cvar_Get("gl_shaders", "1", CVAR_FILES);
 #if USE_MD5
     gl_md5_load = Cvar_Get("gl_md5_load", "1", CVAR_FILES);
     gl_md5_use = Cvar_Get("gl_md5_use", "1", 0);
+    gl_md5_distance = Cvar_Get("gl_md5_distance", "2048", 0);
 #endif
-    gl_waterwarp = Cvar_Get("gl_waterwarp", "0", 0);
+    gl_damageblend_frac = Cvar_Get("gl_damageblend_frac", "0.2", 0);
+    gl_waterwarp = Cvar_Get("gl_waterwarp", "1", 0);
+    gl_fog = Cvar_Get("gl_fog", "1", 0);
+    gl_bloom = Cvar_Get("gl_bloom", "1", 0);
     gl_swapinterval = Cvar_Get("gl_swapinterval", "1", CVAR_ARCHIVE);
     gl_swapinterval->changed = gl_swapinterval_changed;
 
@@ -927,14 +1016,16 @@ static void GL_Register(void)
     gl_showtris = Cvar_Get("gl_showtris", "0", CVAR_CHEAT);
     gl_showorigins = Cvar_Get("gl_showorigins", "0", CVAR_CHEAT);
     gl_showtearing = Cvar_Get("gl_showtearing", "0", CVAR_CHEAT);
+    gl_showbloom = Cvar_Get("gl_showbloom", "0", CVAR_CHEAT);
 #if USE_DEBUG
-    gl_showstats = Cvar_Get("gl_showstats", "0", 0);
     gl_showscrap = Cvar_Get("gl_showscrap", "0", 0);
     gl_nobind = Cvar_Get("gl_nobind", "0", CVAR_CHEAT);
+    gl_novbo = Cvar_Get("gl_novbo", "0", CVAR_FILES);
     gl_test = Cvar_Get("gl_test", "0", 0);
 #endif
     gl_cull_nodes = Cvar_Get("gl_cull_nodes", "1", 0);
     gl_cull_models = Cvar_Get("gl_cull_models", "1", 0);
+    gl_showcull = Cvar_Get("gl_showcull", "0", CVAR_CHEAT);
     gl_clear = Cvar_Get("gl_clear", "0", 0);
     gl_finish = Cvar_Get("gl_finish", "0", 0);
     gl_novis = Cvar_Get("gl_novis", "0", 0);
@@ -948,6 +1039,7 @@ static void GL_Register(void)
     gl_lightgrid = Cvar_Get("gl_lightgrid", "1", 0);
     gl_polyblend = Cvar_Get("gl_polyblend", "1", 0);
     gl_showerrors = Cvar_Get("gl_showerrors", "1", 0);
+    gl_damageblend_frac = Cvar_Get("gl_damageblend_frac", "0.2", 0);
 
     gl_lightmap_changed(NULL);
     gl_modulate_entities_changed(NULL);
@@ -968,9 +1060,9 @@ static void APIENTRY myDebugProc(GLenum source, GLenum type, GLuint id, GLenum s
     int level = PRINT_DEVELOPER;
 
     switch (severity) {
-    case GL_DEBUG_SEVERITY_HIGH:   level = PRINT_ERROR;   break;
-    case GL_DEBUG_SEVERITY_MEDIUM: level = PRINT_WARNING; break;
-    case GL_DEBUG_SEVERITY_LOW:    level = PRINT_ALL;     break;
+        case GL_DEBUG_SEVERITY_HIGH:   level = PRINT_ERROR;   break;
+        case GL_DEBUG_SEVERITY_MEDIUM: level = PRINT_WARNING; break;
+        case GL_DEBUG_SEVERITY_LOW:    level = PRINT_ALL;     break;
     }
 
     Com_LPrintf(level, "%s\n", message);
@@ -980,56 +1072,111 @@ static void GL_SetupConfig(void)
 {
     GLint integer = 0;
 
-    gl_config.colorbits = 0;
-    qglGetIntegerv(GL_RED_BITS, &integer);
-    gl_config.colorbits += integer;
-    qglGetIntegerv(GL_GREEN_BITS, &integer);
-    gl_config.colorbits += integer;
-    qglGetIntegerv(GL_BLUE_BITS, &integer);
-    gl_config.colorbits += integer;
+    qglGetIntegerv(GL_MAX_TEXTURE_SIZE, &integer);
+    gl_config.max_texture_size_log2 = Q_log2(min(integer, MAX_TEXTURE_SIZE));
+    gl_config.max_texture_size = 1U << gl_config.max_texture_size_log2;
 
-    qglGetIntegerv(GL_DEPTH_BITS, &integer);
-    gl_config.depthbits = integer;
+    if (gl_config.caps & QGL_CAP_CLIENT_VA) {
+        qglGetIntegerv(GL_RED_BITS, &integer);
+        gl_config.colorbits = integer;
+        qglGetIntegerv(GL_GREEN_BITS, &integer);
+        gl_config.colorbits += integer;
+        qglGetIntegerv(GL_BLUE_BITS, &integer);
+        gl_config.colorbits += integer;
 
-    qglGetIntegerv(GL_STENCIL_BITS, &integer);
-    gl_config.stencilbits = integer;
+        qglGetIntegerv(GL_DEPTH_BITS, &integer);
+        gl_config.depthbits = integer;
+
+        qglGetIntegerv(GL_STENCIL_BITS, &integer);
+        gl_config.stencilbits = integer;
+    } else if (qglGetFramebufferAttachmentParameteriv) {
+        GLenum backbuf = gl_config.ver_es ? GL_BACK : GL_BACK_LEFT;
+
+        qglGetFramebufferAttachmentParameteriv(GL_FRAMEBUFFER, backbuf, GL_FRAMEBUFFER_ATTACHMENT_RED_SIZE, &integer);
+        gl_config.colorbits = integer;
+        qglGetFramebufferAttachmentParameteriv(GL_FRAMEBUFFER, backbuf, GL_FRAMEBUFFER_ATTACHMENT_GREEN_SIZE, &integer);
+        gl_config.colorbits += integer;
+        qglGetFramebufferAttachmentParameteriv(GL_FRAMEBUFFER, backbuf, GL_FRAMEBUFFER_ATTACHMENT_BLUE_SIZE, &integer);
+        gl_config.colorbits += integer;
+
+        qglGetFramebufferAttachmentParameteriv(GL_FRAMEBUFFER, GL_DEPTH, GL_FRAMEBUFFER_ATTACHMENT_DEPTH_SIZE, &integer);
+        gl_config.depthbits = integer;
+
+        qglGetFramebufferAttachmentParameteriv(GL_FRAMEBUFFER, GL_STENCIL, GL_FRAMEBUFFER_ATTACHMENT_STENCIL_SIZE, &integer);
+        gl_config.stencilbits = integer;
+    }
 
     if (qglDebugMessageCallback && qglIsEnabled(GL_DEBUG_OUTPUT)) {
         Com_Printf("Enabling GL debug output.\n");
         qglEnable(GL_DEBUG_OUTPUT_SYNCHRONOUS);
+        if (Cvar_VariableInteger("gl_debug") < 2)
+            qglDebugMessageControl(GL_DONT_CARE, GL_DONT_CARE, GL_DEBUG_SEVERITY_NOTIFICATION, 0, NULL, GL_FALSE);
         qglDebugMessageCallback(myDebugProc, NULL);
     }
+
+    if (gl_config.caps & QGL_CAP_SHADER_STORAGE) {
+        integer = 0;
+        qglGetIntegerv(GL_MAX_VERTEX_SHADER_STORAGE_BLOCKS, &integer);
+        if (integer < 2) {
+            Com_DPrintf("Not enough shader storage blocks available\n");
+            gl_config.caps &= ~QGL_CAP_SHADER_STORAGE;
+        } else {
+            integer = 1;
+            qglGetIntegerv(GL_SHADER_STORAGE_BUFFER_OFFSET_ALIGNMENT, &integer);
+            if (integer & (integer - 1))
+                integer = Q_npot32(integer);
+            Com_DPrintf("SSBO alignment: %d\n", integer);
+            gl_config.ssbo_align = integer;
+        }
+    }
+
+    if (gl_config.caps & QGL_CAP_BUFFER_TEXTURE) {
+        integer = 0;
+        qglGetIntegerv(GL_MAX_TEXTURE_BUFFER_SIZE, &integer);
+        if (integer < MOD_MAXSIZE_GPU) {
+            Com_DPrintf("Not enough buffer texture size available\n");
+            gl_config.caps &= ~QGL_CAP_BUFFER_TEXTURE;
+        }
+    }
+
+    if (gl_config.caps & QGL_CAP_TEXTURE_ANISOTROPY) {
+        qglGetFloatv(GL_MAX_TEXTURE_MAX_ANISOTROPY, &gl_config.max_anisotropy);
+    }
+
+    GL_ShowErrors(__func__);
 }
 
 static void GL_InitTables(void)
 {
-    vec_t lat, lng;
-    const vec_t *v;
-    int i;
+    for (int i = 0; i < NUMVERTEXNORMALS; i++) {
+        const vec_t *v = bytedirs[i];
+        float lat = acosf(v[2]);
+        float lng = atan2f(v[1], v[0]);
 
-    for (i = 0; i < NUMVERTEXNORMALS; i++) {
-        v = bytedirs[i];
-        lat = acos(v[2]);
-        lng = atan2(v[1], v[0]);
-        gl_static.latlngtab[i][0] = (int)(lat * (float)(255 / (2 * M_PI))) & 255;
-        gl_static.latlngtab[i][1] = (int)(lng * (float)(255 / (2 * M_PI))) & 255;
+        gl_static.latlngtab[i][0] = (int)(lat * (255 / (2 * M_PIf))) & 255;
+        gl_static.latlngtab[i][1] = (int)(lng * (255 / (2 * M_PIf))) & 255;
     }
 
-    for (i = 0; i < 256; i++) {
-        gl_static.sintab[i] = sin(i * (2 * M_PI / 255));
-    }
+    for (int i = 0; i < 256; i++)
+        gl_static.sintab[i] = sinf(i * (2 * M_PIf / 255));
 }
 
 static void GL_PostInit(void)
 {
-    registration_sequence = 1;
+    r_registration_sequence = 1;
 
+    if (gl_shaders->modified_count != gl_shaders_modified) {
+        GL_ShutdownState();
+        GL_InitState();
+        gl_shaders_modified = gl_shaders->modified_count;
+    }
     GL_ClearState();
     GL_InitImages();
+    GL_InitQueries();
     MOD_Init();
 }
 
-static void GL_InitQueries(void)
+void GL_InitQueries(void)
 {
     if (!qglBeginQuery)
         return;
@@ -1038,10 +1185,11 @@ static void GL_InitQueries(void)
     if (gl_config.ver_gl >= QGL_VER(3, 3) || gl_config.ver_es >= QGL_VER(3, 0))
         gl_static.samples_passed = GL_ANY_SAMPLES_PASSED;
 
-    gl_static.queries = HashMap_Create(int, glquery_t, HashInt32, NULL);
+    Q_assert(!gl_static.queries);
+    gl_static.queries = HashMap_TagCreate(int, glquery_t, HashInt32, NULL, TAG_RENDERER);
 }
 
-static void GL_ShutdownQueries(void)
+void GL_DeleteQueries(void)
 {
     if (!gl_static.queries)
         return;
@@ -1052,23 +1200,41 @@ static void GL_ShutdownQueries(void)
         qglDeleteQueries(1, &q->query);
     }
 
+    if (map_size)
+        Com_DPrintf("%s: %u queries deleted\n", __func__, map_size);
+
     HashMap_Destroy(gl_static.queries);
     gl_static.queries = NULL;
 }
 
-static void GL_ClearQueries(void)
-{
-    if (!gl_static.queries)
-        return;
-
-    uint32_t map_size = HashMap_Size(gl_static.queries);
-    for (int i = 0; i < map_size; i++) {
-        glquery_t *q = HashMap_GetValue(glquery_t, gl_static.queries, i);
-        q->pending = q->visible = false;
-    }
-}
-
 // ==============================================================================
+
+static void Draw_Stats_s(void)
+{
+    SCR_StatKeyValuei("Nodes visible", glr.nodes_visible);
+    SCR_StatKeyValuei("Nodes culled", c.nodesCulled);
+    SCR_StatKeyValuei("Nodes drawn", c.nodesDrawn);
+    SCR_StatKeyValuei("Leaves drawn", c.leavesDrawn);
+    SCR_StatKeyValuei("Faces drawn", c.facesDrawn);
+    SCR_StatKeyValuei("Faces culled", c.facesCulled);
+    SCR_StatKeyValuei("Boxes culled", c.boxesCulled);
+    SCR_StatKeyValuei("Spheres culled", c.spheresCulled);
+    SCR_StatKeyValuei("RtBoxes culled", c.rotatedBoxesCulled);
+    SCR_StatKeyValuei("Tris drawn", c.trisDrawn);
+    SCR_StatKeyValuei("Tex switches", c.texSwitches);
+    SCR_StatKeyValuei("Tex uploads", c.texUploads);
+    SCR_StatKeyValuei("LM texels", c.lightTexels);
+    SCR_StatKeyValuei("Batches drawn", c.batchesDrawn);
+    SCR_StatKeyValuef("Faces / batch", c.batchesDrawn ? (float)c.facesDrawn / c.batchesDrawn : 0.0f);
+    SCR_StatKeyValuef("Tris / batch", c.batchesDrawn ? (float)c.facesTris / c.batchesDrawn : 0.0f);
+    SCR_StatKeyValuei("2D batches", c.batchesDrawn2D);
+    SCR_StatKeyValuei("Total entities", glr.fd.num_entities);
+    SCR_StatKeyValuei("Total dlights", glr.fd.num_dlights);
+    SCR_StatKeyValuei("Total particles", glr.fd.num_particles);
+    SCR_StatKeyValuei("Uniform uploads", c.uniformUploads);
+    SCR_StatKeyValuei("Array binds", c.vertexArrayBinds);
+    SCR_StatKeyValuei("Occl. queries", c.occlusionQueries);
+}
 
 /*
 ===============
@@ -1085,18 +1251,16 @@ bool R_Init(bool total)
     }
 
     Com_Printf("------- R_Init -------\n");
-    Com_Printf("Using video driver: %s\n", vid.name);
+    Com_Printf("Using video driver: %s\n", vid->name);
 
     // initialize OS-specific parts of OpenGL
     // create the window and set up the context
-    if (!vid.init()) {
+    if (!vid->init())
         return false;
-    }
 
     // initialize our QGL dynamic bindings
-    if (!QGL_Init()) {
+    if (!QGL_Init())
         goto fail;
-    }
 
     // get various limits from OpenGL
     GL_SetupConfig();
@@ -1104,15 +1268,19 @@ bool R_Init(bool total)
     // register our variables
     GL_Register();
 
+    GL_InitArrays();
+
     GL_InitState();
 
-    GL_InitQueries();
-
     GL_InitTables();
+
+    GL_InitDebugDraw();
 
     GL_PostInit();
 
     GL_ShowErrors(__func__);
+
+    SCR_RegisterStat("refresh", Draw_Stats_s);
 
     Com_Printf("----------------------\n");
 
@@ -1122,7 +1290,7 @@ fail:
     memset(&gl_static, 0, sizeof(gl_static));
     memset(&gl_config, 0, sizeof(gl_config));
     QGL_Shutdown();
-    vid.shutdown();
+    vid->shutdown();
     return false;
 }
 
@@ -1136,24 +1304,30 @@ void R_Shutdown(bool total)
     Com_DPrintf("GL_Shutdown( %i )\n", total);
 
     GL_FreeWorld();
+    GL_DeleteQueries();
     GL_ShutdownImages();
     MOD_Shutdown();
 
-    if (!total) {
+    if (!total)
         return;
-    }
 
-    GL_ShutdownQueries();
+    GL_ShutdownDebugDraw();
 
     GL_ShutdownState();
+
+    GL_ShutdownArrays();
 
     // shutdown our QGL subsystem
     QGL_Shutdown();
 
     // shut down OS specific OpenGL stuff like contexts, etc.
-    vid.shutdown();
+    vid->shutdown();
 
     GL_Unregister();
+
+    GL_ShutdownDebugDraw();
+
+    SCR_UnregisterStat("refresh");
 
     memset(&gl_static, 0, sizeof(gl_static));
     memset(&gl_config, 0, sizeof(gl_config));
@@ -1164,14 +1338,18 @@ void R_Shutdown(bool total)
 R_GetGLConfig
 ===============
 */
-r_opengl_config_t *R_GetGLConfig(void)
+r_opengl_config_t R_GetGLConfig(void)
 {
-    static r_opengl_config_t cfg;
+#define GET_CVAR(name, def, min, max) \
+    Cvar_ClampInteger(Cvar_Get(name, def, CVAR_REFRESH), min, max)
 
-    cfg.colorbits    = Cvar_ClampInteger(Cvar_Get("gl_colorbits",    "0", CVAR_REFRESH), 0, 32);
-    cfg.depthbits    = Cvar_ClampInteger(Cvar_Get("gl_depthbits",    "0", CVAR_REFRESH), 0, 32);
-    cfg.stencilbits  = Cvar_ClampInteger(Cvar_Get("gl_stencilbits",  "8", CVAR_REFRESH), 0,  8);
-    cfg.multisamples = Cvar_ClampInteger(Cvar_Get("gl_multisamples", "0", CVAR_REFRESH), 0, 32);
+    r_opengl_config_t cfg = {
+        .colorbits    = GET_CVAR("gl_colorbits",    "0", 0, 32),
+        .depthbits    = GET_CVAR("gl_depthbits",    "0", 0, 32),
+        .stencilbits  = GET_CVAR("gl_stencilbits",  "8", 0,  8),
+        .multisamples = GET_CVAR("gl_multisamples", "0", 0, 32),
+        .debug        = GET_CVAR("gl_debug",        "0", 0,  2),
+    };
 
     if (cfg.colorbits == 0)
         cfg.colorbits = 24;
@@ -1185,8 +1363,30 @@ r_opengl_config_t *R_GetGLConfig(void)
     if (cfg.multisamples < 2)
         cfg.multisamples = 0;
 
-    cfg.debug = Cvar_Get("gl_debug", "0", CVAR_REFRESH)->integer;
-    return &cfg;
+    const char *s = Cvar_Get("gl_profile", DEFGLPROFILE, CVAR_REFRESH)->string;
+
+    if (!Q_stricmpn(s, "gl", 2))
+        cfg.profile = QGL_PROFILE_CORE;
+    else if (!Q_stricmpn(s, "es", 2))
+        cfg.profile = QGL_PROFILE_ES;
+
+    if (cfg.profile) {
+        int major = 0, minor = 0;
+
+        sscanf(s + 2, "%d.%d", &major, &minor);
+        if (major >= 1 && minor >= 0) {
+            cfg.major_ver = major;
+            cfg.minor_ver = minor;
+        } else if (cfg.profile == QGL_PROFILE_CORE) {
+            cfg.major_ver = 3;
+            cfg.minor_ver = 2;
+        } else if (cfg.profile == QGL_PROFILE_ES) {
+            cfg.major_ver = 3;
+            cfg.minor_ver = 0;
+        }
+    }
+
+    return cfg;
 }
 
 /*
@@ -1196,20 +1396,15 @@ R_BeginRegistration
 */
 void R_BeginRegistration(const char *name)
 {
-    char fullname[MAX_QPATH];
-
     gl_static.registering = true;
-    registration_sequence++;
+    r_registration_sequence++;
 
     memset(&glr, 0, sizeof(glr));
     glr.viewcluster1 = glr.viewcluster2 = -2;
 
-    if (name) {
-        Q_concat(fullname, sizeof(fullname), "maps/", name, ".bsp");
-        GL_LoadWorld(fullname);
-    }
+    GL_LoadWorld(name);
 
-    GL_ClearQueries();
+    R_ClearDebugLines();
 }
 
 /*

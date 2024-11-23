@@ -1,0 +1,91 @@
+name: nightly
+
+on:
+  push:
+    branches: [rerelease-game]
+  workflow_dispatch:
+
+env:
+  # FIXME: Re-add '--fatal-meson-warnings' when meson fixed 'CMake Toolchain: Failed to determine CMake compilers state' w/ openal
+  MESON_ARGS: >-
+    -Danticheat-server=true
+    -Dpacketdup-hack=true
+    -Dtests=true
+    -Dwerror=true
+    -Davcodec=enabled
+    -Dffmpeg:werror=false
+    -Dlibcurl=enabled
+    -Dlibjpeg=enabled
+    -Dlibpng=enabled
+    -Dopenal=enabled
+    -Dopenal-soft:werror=false
+    -Dsoftware-sound=enabled
+    -Dzlib=enabled
+
+  MESON_ARGS_WIN: >-
+    -Dicmp-errors=enabled
+    -Dwrap_mode=forcefallback
+    -Dwindows-crash-dumps=enabled
+
+jobs:
+  msvc:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - uses: actions/cache@v4
+        with:
+          path: subprojects/packagecache
+          key: ${{ hashFiles('subprojects/*.wrap') }}
+
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - uses: ilammy/setup-nasm@v1
+
+      - name: Install dependencies
+        run: pip3 install --no-input meson ninja
+
+      - name: Build - meson setup
+        run: |
+          meson setup ${{ env.MESON_ARGS }} ${{ env.MESON_ARGS_WIN }} builddir
+
+      - name: Build info - meson configure
+        run: |
+          meson configure builddir
+
+      - name: Build - meson compile
+        run: |
+          meson compile -C builddir
+          meson install -C builddir --tags runtime --destdir ${{ github.workspace }}/installdir
+
+      - name: Setup variables
+        uses: actions/github-script@v7
+        with:
+          script: core.exportVariable('GITHUB_SHA_SHORT', context.sha.substring(0, 7))
+
+      - name: Zip
+        run: |
+          Compress-Archive -Path "${{ github.workspace }}/installdir/q2pro.exe", "${{ github.workspace }}/builddir/q2pro.pdb", "${{ github.workspace }}/installdir/q2proded.exe", "${{ github.workspace }}/builddir/q2proded.pdb" -CompressionLevel "Optimal" -DestinationPath "q2pro-rerelease-client_win64_x64.zip"
+
+      - name: Update release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release edit nightly -t "Nightly" -n "Latest nightly build" --latest
+          gh release upload nightly q2pro-rerelease-client_win64_x64.zip --clobber
+
+      - name: Update tag
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.git.updateRef({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              ref: "tags/nightly",
+              sha: context.sha,
+              force: true
+            })
